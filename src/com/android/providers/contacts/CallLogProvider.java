@@ -36,6 +36,7 @@ import android.database.Cursor;
 import android.database.DatabaseUtils;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteQueryBuilder;
+import android.database.sqlite.SQLiteTokenizer;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
@@ -52,12 +53,15 @@ import android.telecom.TelecomManager;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
 import android.util.ArrayMap;
+import android.util.EventLog;
 import android.util.Log;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.util.ProviderAccessStats;
 import com.android.providers.contacts.CallLogDatabaseHelper.DbProperties;
 import com.android.providers.contacts.CallLogDatabaseHelper.Tables;
+import com.android.providers.contacts.util.FileUtilities;
+import com.android.providers.contacts.util.NeededForTesting;
 import com.android.providers.contacts.util.SelectionBuilder;
 import com.android.providers.contacts.util.UserUtils;
 
@@ -78,6 +82,8 @@ import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.stream.Collectors;
@@ -429,10 +435,11 @@ public class CallLogProvider extends ContentProvider {
                 List<String> pathSegments = uri.getPathSegments();
                 String phoneNumber = pathSegments.size() >= 2 ? pathSegments.get(2) : null;
                 if (!TextUtils.isEmpty(phoneNumber)) {
-                    qb.appendWhere("PHONE_NUMBERS_EQUAL(number, ");
-                    qb.appendWhereEscapeString(phoneNumber);
+                    qb.appendWhere("PHONE_NUMBERS_EQUAL(number, ?");
                     qb.appendWhere(mUseStrictPhoneNumberComparation ? ", 1)"
                             : ", 0, " + mMinMatch + ")");
+                    selectionArgs = copyArrayAndAppendElement(selectionArgs,
+                            "'" + phoneNumber + "'");
                 } else {
                     qb.appendWhere(Calls.NUMBER_PRESENTATION + "!="
                             + Calls.PRESENTATION_ALLOWED);
@@ -454,10 +461,66 @@ public class CallLogProvider extends ContentProvider {
         final SQLiteDatabase db = mDbHelper.getReadableDatabase();
         final Cursor c = qb.query(db, projection, selectionBuilder.build(), selectionArgs, null,
                 null, sortOrder, limitClause);
+
+        if (match == CALLS_FILTER && selectionArgs.length > 0) {
+            // throw SE if the user is sending requests that try to bypass voicemail permissions
+            examineEmptyCursorCause(c, selectionArgs[selectionArgs.length - 1]);
+        }
+
         if (c != null) {
             c.setNotificationUri(getContext().getContentResolver(), CallLog.CONTENT_URI);
         }
         return c;
+    }
+
+    /**
+     * Helper method for queryInternal that appends an extra argument to the existing selection
+     * arguments array.
+     *
+     * @param oldSelectionArguments the existing selection argument array in queryInternal
+     * @param phoneNumber           the phoneNumber that was passed into queryInternal
+     * @return the new selection argument array with the phoneNumber as the last argument
+     */
+    private String[] copyArrayAndAppendElement(String[] oldSelectionArguments, String phoneNumber) {
+        if (oldSelectionArguments == null) {
+            return new String[]{phoneNumber};
+        }
+        String[] newSelectionArguments = new String[oldSelectionArguments.length + 1];
+        System.arraycopy(oldSelectionArguments, 0, newSelectionArguments, 0,
+                oldSelectionArguments.length);
+        newSelectionArguments[oldSelectionArguments.length] = phoneNumber;
+        return newSelectionArguments;
+    }
+
+    /**
+     * Helper that throws a Security Exception if the Cursor object is empty && the phoneNumber
+     * appears to have SQL.
+     *
+     * @param cursor      returned from the query.
+     * @param phoneNumber string to check for SQL.
+     */
+    private void examineEmptyCursorCause(Cursor cursor, String phoneNumber) {
+        // checks if the cursor is empty
+        if ((cursor == null) || !cursor.moveToFirst()) {
+            try {
+                // tokenize the phoneNumber and run each token through a checker
+                SQLiteTokenizer.tokenize(phoneNumber, SQLiteTokenizer.OPTION_NONE,
+                        this::enforceStrictPhoneNumber);
+            } catch (IllegalArgumentException e) {
+                EventLog.writeEvent(0x534e4554, "224771921", Binder.getCallingUid(),
+                        ("invalid phoneNumber passed to queryInternal"));
+                throw new SecurityException("invalid phoneNumber passed to queryInternal");
+            }
+        }
+    }
+
+    private void enforceStrictPhoneNumber(String token) {
+        boolean isAllowedKeyword = SQLiteTokenizer.isKeyword(token);
+        Set<String> lookupTable = Set.of("UNION", "SELECT", "FROM", "WHERE",
+                "GROUP", "HAVING", "WINDOW", "VALUES", "ORDER", "LIMIT");
+        if (!isAllowedKeyword || lookupTable.contains(token.toUpperCase(Locale.US))) {
+            throw new IllegalArgumentException("Invalid token " + token);
+        }
     }
 
     private void queryForTesting(Uri uri) {
@@ -651,6 +714,7 @@ public class CallLogProvider extends ContentProvider {
                 throw new FileNotFoundException(uri.toString()
                         + " does not correspond to a valid file.");
             }
+            enforceValidCallLogPath(callComposerDir, pictureFile,"openFile");
             return ParcelFileDescriptor.open(pictureFile.toFile(), modeInt);
         } catch (IOException e) {
             Log.e(TAG, "IOException while opening call composer file: " + e);
@@ -764,6 +828,8 @@ public class CallLogProvider extends ContentProvider {
             return null;
         }
         Path pathToFile = pathToCallComposerDir.resolve(fileName);
+        enforceValidCallLogPath(pathToCallComposerDir, pathToFile,
+                "allocateNewCallComposerPicture");
         Files.createFile(pathToFile);
 
         if (forAllUsers) {
@@ -777,10 +843,10 @@ public class CallLogProvider extends ContentProvider {
     private int deleteCallComposerPicture(Uri uri) {
         try {
             Path pathToCallComposerDir = getCallComposerPictureDirectory(getContext(), uri);
-            String fileName = uri.getLastPathSegment();
-            boolean successfulDelete =
-                    Files.deleteIfExists(pathToCallComposerDir.resolve(fileName));
-            return successfulDelete ? 1 : 0;
+            Path fileToDelete = pathToCallComposerDir.resolve(uri.getLastPathSegment());
+            enforceValidCallLogPath(pathToCallComposerDir, fileToDelete,
+                    "deleteCallComposerPicture");
+            return Files.deleteIfExists(fileToDelete) ? 1 : 0;
         } catch (IOException e) {
             Log.e(TAG, "IOException encountered deleting the call composer pics dir " + e);
             return 0;
@@ -1045,8 +1111,9 @@ public class CallLogProvider extends ContentProvider {
         for (Uri uri : urisToCopy) {
             try {
                 Uri uriWithUser = ContentProvider.maybeAddUserId(uri, sourceUserId);
-                Path newFilePath = getCallComposerPictureDirectory(getContext(), false)
-                        .resolve(uri.getLastPathSegment());
+                Path callComposerDir = getCallComposerPictureDirectory(getContext(), false);
+                Path newFilePath = callComposerDir.resolve(uri.getLastPathSegment());
+                enforceValidCallLogPath(callComposerDir, newFilePath,"syncCallComposerPics");
                 try (ParcelFileDescriptor remoteFile = contentResolver.openFile(uriWithUser,
                         "r", null);
                      OutputStream localOut =
@@ -1220,5 +1287,20 @@ public class CallLogProvider extends ContentProvider {
     @Override
     public void dump(FileDescriptor fd, PrintWriter writer, String[] args) {
         mStats.dump(writer, "  ");
+    }
+
+    /**
+     *  Enforces a stricter check on what files the CallLogProvider can perform file operations on.
+     * @param rootPath where all valid new/existing paths should pass through.
+     * @param pathToCheck newly created path that is requesting a file op. (open, delete, etc.)
+     * @param callingMethod the calling method.  Used only for debugging purposes.
+     */
+    private void enforceValidCallLogPath(Path rootPath, Path pathToCheck, String callingMethod){
+        if (!FileUtilities.isSameOrSubDirectory(rootPath.toFile(), pathToCheck.toFile())) {
+            EventLog.writeEvent(0x534e4554, "219015884", Binder.getCallingUid(),
+                    (callingMethod + ": invalid uri passed"));
+            throw new SecurityException(
+                    FileUtilities.INVALID_CALL_LOG_PATH_EXCEPTION_MESSAGE + pathToCheck);
+        }
     }
 }
