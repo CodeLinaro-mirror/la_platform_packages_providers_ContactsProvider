@@ -27,6 +27,7 @@ import static com.android.providers.contacts.util.PhoneAccountHandleMigrationUti
 import android.accounts.Account;
 import android.accounts.AccountManager;
 import android.accounts.OnAccountsUpdateListener;
+import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.annotation.WorkerThread;
 import android.app.AppOpsManager;
@@ -48,6 +49,7 @@ import android.content.UriMatcher;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.pm.ProviderInfo;
+import android.content.pm.UserInfo;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.Resources;
 import android.content.res.Resources.NotFoundException;
@@ -77,6 +79,7 @@ import android.os.RemoteException;
 import android.os.StrictMode;
 import android.os.SystemClock;
 import android.os.UserHandle;
+import android.os.UserManager;
 import android.preference.PreferenceManager;
 import android.provider.BaseColumns;
 import android.provider.ContactsContract;
@@ -342,6 +345,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
     public static final int CONTACTS_ID_PHOTO_CORP = 1027;
     public static final int CONTACTS_ID_DISPLAY_PHOTO_CORP = 1028;
     public static final int CONTACTS_FILTER_ENTERPRISE = 1029;
+    public static final int CONTACTS_ENTERPRISE = 1030;
 
     public static final int RAW_CONTACTS = 2002;
     public static final int RAW_CONTACTS_ID = 2003;
@@ -1207,6 +1211,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/frequent", CONTACTS_FREQUENT);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/delete_usage", CONTACTS_DELETE_USAGE);
 
+        matcher.addURI(ContactsContract.AUTHORITY, "contacts/enterprise", CONTACTS_ENTERPRISE);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/filter_enterprise",
                 CONTACTS_FILTER_ENTERPRISE);
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/filter_enterprise/*",
@@ -5620,8 +5625,15 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
         // If caller does not come from same profile, Check if it's privileged or allowed by
         // enterprise policy
-        if (!queryAllowedByEnterprisePolicy(uri)) {
+        if (!isCrossUserQueryAllowed(uri)) {
             return null;
+        }
+
+        // TODO(b/253449368) - The call below should be gated by the app-cloning feature flag.
+        if (UserUtils.shouldUseParentsContacts(getContext()) &&
+                isAppAllowedToUseParentUsersContacts(getCallingPackage())) {
+            return queryParentProfileContactsProvider(uri, projection, selection, selectionArgs,
+                    sortOrder, cancellationSignal);
         }
 
         // Query the profile DB if appropriate.
@@ -5643,7 +5655,22 @@ public class ContactsProvider2 extends AbstractContactsProvider
         }
     }
 
-    private boolean queryAllowedByEnterprisePolicy(Uri uri) {
+    @VisibleForTesting
+    protected boolean isAppAllowedToUseParentUsersContacts(@Nullable String packageName) {
+        try {
+            for (String appName: getContext().getResources()
+                    .getStringArray(com.android.internal.R.array.cloneable_apps)) {
+                if (packageName != null && packageName.equals(appName)) {
+                    return true;
+                }
+            }
+        } catch (NotFoundException nfe) {
+            Log.w(TAG, "Resource corresponding to list of cloneable apps not found");
+        }
+        return false;
+    }
+
+    private boolean isCrossUserQueryAllowed(Uri uri) {
         if (isCallerFromSameUser()) {
             // Caller is on the same user; query allowed.
             return true;
@@ -5651,20 +5678,45 @@ public class ContactsProvider2 extends AbstractContactsProvider
         if (!doesCallerHoldInteractAcrossUserPermission()) {
             // Cross-user and the caller has no INTERACT_ACROSS_USERS; don't allow query.
             // Technically, in a cross-profile sharing case, this would be a valid query.
-            // But for now we don't allow it. (We never allowe it and no one complained about it.)
+            // But for now we don't allow it. (We never allowed it and no one complained about it.)
             return false;
         }
         if (isCallerAnotherSelf()) {
-            // The caller is the other CP2 (which has INTERACT_ACROSS_USERS), meaning the reuest
+            // The caller is the other CP2 (which has INTERACT_ACROSS_USERS), meaning the request
             // is on behalf of a "real" client app.
+
+            // TODO(b/253449368) - The condition below should only be checked behind the app-cloning
+            // feature flag
+            if (doesCallingProviderUseCurrentUsersContacts())  {
+                // The caller is the other CP2 (which has INTERACT_ACROSS_USERS), from the child
+                // user (of the current user) profile with the property of using parent's contacts
+                // set.
+                return true;
+            }
             // Consult the enterprise policy.
-            return mEnterprisePolicyGuard.isCrossProfileAllowed(uri);
+            return mEnterprisePolicyGuard.isCrossProfileAllowed(uri, getRealCallerPackageName(uri));
         }
         return true;
     }
 
     private boolean isCallerFromSameUser() {
         return UserHandle.getUserId(Binder.getCallingUid()) == UserHandle.myUserId();
+    }
+
+    /**
+     * Returns true if calling contacts provider instance uses current users contacts.
+     * This can happen when the current user is the parent of the calling user and the calling user
+     * has the corresponding user property to use parent's contacts set. Please note that this
+     * cross-profile contact access will only be allowed if the call is redirected from the child
+     * user's CP2.
+     */
+    private boolean doesCallingProviderUseCurrentUsersContacts() {
+        UserHandle callingUserHandle = UserHandle.getUserHandleForUid(Binder.getCallingUid());
+        UserHandle currentUserHandle = android.os.Process.myUserHandle();
+        boolean isCallerFromSameUser = callingUserHandle.equals(currentUserHandle);
+        return isCallerFromSameUser ||
+                (UserUtils.shouldUseParentsContacts(getContext(), callingUserHandle) &&
+                UserUtils.isParentUser(getContext(), currentUserHandle, callingUserHandle));
     }
 
     /**
@@ -5697,7 +5749,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
         return !UserUtils.shouldUseParentsContacts(getContext());
     }
 
-    private Cursor queryDirectoryIfNecessary(Uri uri, String[] projection, String selection,
+    @VisibleForTesting
+    protected Cursor queryDirectoryIfNecessary(Uri uri, String[] projection, String selection,
             String[] selectionArgs, String sortOrder, CancellationSignal cancellationSignal) {
         String directory = getQueryParameter(uri, ContactsContract.DIRECTORY_PARAM_KEY);
         final long directoryId =
@@ -5745,14 +5798,14 @@ public class ContactsProvider2 extends AbstractContactsProvider
             final String passedPackage = queryUri.getQueryParameter(
                     Directory.CALLER_PACKAGE_PARAM_KEY);
             if (TextUtils.isEmpty(passedPackage)) {
-                Log.wtfStack(TAG,
-                        "Cross-profile query with no " + Directory.CALLER_PACKAGE_PARAM_KEY);
-                return "UNKNOWN";
+                throw new IllegalArgumentException(
+                        "Cross-profile query with no " + Directory.CALLER_PACKAGE_PARAM_KEY
+                                + " param. Uri: " + queryUri);
             }
             return passedPackage;
         } else {
             // Otherwise, just return the real calling package name.
-            return getCallingPackage();
+            return getCallingPackageUnchecked();
         }
     }
 
@@ -5862,11 +5915,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             return createEmptyCursor(localUri, projection);
         }
         // Make sure authority is CP2 not other providers
-        if (!ContactsContract.AUTHORITY.equals(localUri.getAuthority())) {
-            Log.w(TAG, "Invalid authority: " + localUri.getAuthority());
-            throw new IllegalArgumentException(
-                    "Authority " + localUri.getAuthority() + " is not a valid CP2 authority.");
-        }
+        validateAuthority(localUri.getAuthority());
         // Add the "user-id @" to the URI, and also pass the caller package name.
         final Uri remoteUri = maybeAddUserId(localUri, corpUserId).buildUpon()
                 .appendQueryParameter(Directory.CALLER_PACKAGE_PARAM_KEY, getCallingPackage())
@@ -5877,6 +5926,69 @@ public class ContactsProvider2 extends AbstractContactsProvider
             return createEmptyCursor(localUri, projection);
         }
         return cursor;
+    }
+
+    private Uri getParentProviderUri(Uri uri, @NonNull UserInfo parentUserInfo) {
+        // Add the "user-id @" of the parent to the URI
+        final Builder remoteUriBuilder =
+                maybeAddUserId(uri, parentUserInfo.getUserHandle().getIdentifier())
+                        .buildUpon();
+        // Pass the caller package name query param and build the uri
+        return remoteUriBuilder
+                .appendQueryParameter(Directory.CALLER_PACKAGE_PARAM_KEY,
+                        getRealCallerPackageName(uri))
+                .build();
+    }
+
+    protected AssetFileDescriptor openAssetFileThroughParentProvider(Uri uri, String mode)
+            throws FileNotFoundException {
+        final UserInfo parentUserInfo = UserUtils.getProfileParentUser(getContext());
+        if (parentUserInfo == null) {
+            return null;
+        }
+        validateAuthority(uri.getAuthority());
+        final Uri remoteUri = getParentProviderUri(uri, parentUserInfo);
+        return getContext().getContentResolver().openAssetFile(remoteUri, mode, null);
+    }
+
+    /**
+     * A helper function to query parent CP2, should only be called from users that are allowed to
+     * use parents contacts
+     */
+    @VisibleForTesting
+    protected Cursor queryParentProfileContactsProvider(Uri uri, String[] projection,
+            String selection, String[] selectionArgs, String sortOrder,
+            CancellationSignal cancellationSignal) {
+        final UserInfo parentUserInfo = UserUtils.getProfileParentUser(getContext());
+        if (parentUserInfo == null) {
+            return createEmptyCursor(uri, projection);
+        }
+        // Make sure authority is CP2 not other providers
+        validateAuthority(uri.getAuthority());
+        Cursor cursor = queryContactsProviderForUser(uri, projection, selection, selectionArgs,
+                sortOrder, cancellationSignal, parentUserInfo);
+        if (cursor == null) {
+            Log.w(TAG, "null cursor returned from primary CP2");
+            return createEmptyCursor(uri, projection);
+        }
+        return cursor;
+    }
+
+    @VisibleForTesting
+    protected Cursor queryContactsProviderForUser(Uri uri, String[] projection, String selection,
+            String[] selectionArgs, String sortOrder, CancellationSignal cancellationSignal,
+            UserInfo parentUserInfo) {
+        final Uri remoteUri = getParentProviderUri(uri, parentUserInfo);
+        return getContext().getContentResolver().query(remoteUri, projection, selection,
+                selectionArgs, sortOrder, cancellationSignal);
+    }
+
+    private void validateAuthority(String authority) {
+        if (!ContactsContract.AUTHORITY.equals(authority)) {
+            Log.w(TAG, "Invalid authority: " + authority);
+            throw new IllegalArgumentException(
+                    "Authority " + authority + " is not a valid CP2 authority.");
+        }
     }
 
     private Cursor addSnippetExtrasToCursor(Uri uri, Cursor cursor) {
@@ -6402,8 +6514,6 @@ public class ContactsProvider2 extends AbstractContactsProvider
                         new Object[] {getMaxDisplayPhotoDim(), getMaxThumbnailDim()});
             }
             case PHONES_ENTERPRISE: {
-                ContactsPermissions.enforceCallingOrSelfPermission(getContext(),
-                        INTERACT_ACROSS_USERS);
                 return queryMergedDataPhones(uri, projection, selection, selectionArgs, sortOrder,
                         cancellationSignal);
             }
@@ -6571,6 +6681,9 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 }
                 break;
             }
+            case CONTACTS_ENTERPRISE:
+                return queryMergedContacts(projection, selection, selectionArgs, sortOrder,
+                        cancellationSignal);
             case PHONES_FILTER_ENTERPRISE:
             case CALLABLES_FILTER_ENTERPRISE:
             case EMAILS_FILTER_ENTERPRISE:
@@ -7334,8 +7447,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             final Cursor[] cursorArray = new Cursor[] {
                     primaryCursor, rewriteCorpDirectories(corpCursor)
             };
-            final MergeCursor mergeCursor = new MergeCursor(cursorArray);
-            return mergeCursor;
+            return new MergeCursor(cursorArray);
         } catch (Throwable th) {
             if (primaryCursor != null) {
                 primaryCursor.close();
@@ -7345,6 +7457,29 @@ public class ContactsProvider2 extends AbstractContactsProvider
             if (corpCursor != null) {
                 corpCursor.close();
             }
+        }
+    }
+
+    /**
+     * Handles {@link Contacts#ENTERPRISE_CONTENT_URI}.
+     */
+    private Cursor queryMergedContacts(String[] projection, String selection,
+            String[] selectionArgs, String sortOrder, CancellationSignal cancellationSignal) {
+        final Uri localUri = Contacts.CONTENT_URI;
+        try (final Cursor primaryCursor = queryLocal(localUri, projection, selection, selectionArgs,
+                sortOrder, Directory.DEFAULT, cancellationSignal)) {;
+            final int managedUserId = UserUtils.getCorpUserId(getContext());
+            if (managedUserId < 0) {
+                // No managed profile or policy not allowed
+                return primaryCursor;
+            }
+            final Cursor managedCursor = queryCorpContacts(localUri, projection, selection,
+                    selectionArgs, sortOrder, new String[] {Contacts._ID},
+                    Directory.ENTERPRISE_DEFAULT, cancellationSignal);
+            final Cursor[] cursorArray = new Cursor[] {
+                    primaryCursor, managedCursor
+            };
+            return new MergeCursor(cursorArray);
         }
     }
 
@@ -7371,8 +7506,6 @@ public class ContactsProvider2 extends AbstractContactsProvider
         final Cursor primaryCursor = queryLocal(localUri, projection, selection, selectionArgs,
                 sortOrder, directoryId, null);
         try {
-            // PHONES_ENTERPRISE should not be guarded by EnterprisePolicyGuard as Bluetooth app is
-            // responsible to guard it.
             final int corpUserId = UserUtils.getCorpUserId(getContext());
             if (corpUserId < 0) {
                 // No Corp user or policy not allowed
@@ -7382,21 +7515,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
             final Cursor managedCursor = queryCorpContacts(localUri, projection, selection,
                     selectionArgs, sortOrder, new String[] {RawContacts.CONTACT_ID}, null,
                     cancellationSignal);
-            if (managedCursor == null) {
-                // No corp results.  Just return the local result.
-                return primaryCursor;
-            }
             final Cursor[] cursorArray = new Cursor[] {
                     primaryCursor, managedCursor
             };
-            // Sort order is not supported yet, will be fixed in M when we have
-            // merged provider
-            // MergeCursor will copy all the contacts from two cursors, which may
-            // cause OOM if there's a lot of contacts. But it's only used by
-            // Bluetooth, and Bluetooth will loop through the Cursor and put all
-            // content in ArrayList anyway, so we ignore OOM issue here for now
-            final MergeCursor mergeCursor = new MergeCursor(cursorArray);
-            return mergeCursor;
+            return new MergeCursor(cursorArray);
         } catch (Throwable th) {
             if (primaryCursor != null) {
                 primaryCursor.close();
@@ -8771,10 +8893,20 @@ public class ContactsProvider2 extends AbstractContactsProvider
             if (!isDirectoryParamValid(uri)){
                 return null;
             }
-            if (!queryAllowedByEnterprisePolicy(uri)) {
+            if (!isCrossUserQueryAllowed(uri)) {
                 return null;
             }
             waitForAccess(mode.equals("r") ? mReadAccessLatch : mWriteAccessLatch);
+
+            // Redirect reads to parent provider if the corresponding user property is set and app
+            // is allow-listed to access parent's contacts
+            // TODO(b/253449368) - The call below should be gated by the app-cloning feature flag
+            if (mode.equals("r") &&
+                    UserUtils.shouldUseParentsContacts(getContext()) &&
+                    isAppAllowedToUseParentUsersContacts(getCallingPackage())) {
+                return openAssetFileThroughParentProvider(uri, mode);
+            }
+
             final AssetFileDescriptor ret;
             if (mapsToProfileDb(uri)) {
                 switchToProfileMode();
@@ -9088,6 +9220,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
             builder.encodedPath(uri.getEncodedPath());
             builder.appendQueryParameter(ContactsContract.DIRECTORY_PARAM_KEY,
                     String.valueOf(directoryId - Directory.ENTERPRISE_DIRECTORY_ID_BASE));
+            builder.appendQueryParameter(Directory.CALLER_PACKAGE_PARAM_KEY,
+                    getRealCallerPackageName(uri));
             addQueryParametersFromUri(builder, uri, MODIFIED_KEY_SET_FOR_ENTERPRISE_FILTER);
 
             // If work profile is not available, it will throw FileNotFoundException
@@ -9141,12 +9275,14 @@ public class ContactsProvider2 extends AbstractContactsProvider
             throw new FileNotFoundException(uri.toString());
         }
         // Convert the URI into:
-        // content://USER@com.android.contacts/contacts_corp/ID/{photo,display_photo}
+        // content://USER@com.android.contacts/contacts/ID/{photo,display_photo}
         // If work profile is not available, it will throw FileNotFoundException
         final Uri corpUri = maybeAddUserId(
                 ContentUris.appendId(Contacts.CONTENT_URI.buildUpon(), contactId)
                         .appendPath(displayPhoto ?
                                 Contacts.Photo.DISPLAY_PHOTO : Contacts.Photo.CONTENT_DIRECTORY)
+                        .appendQueryParameter(Directory.CALLER_PACKAGE_PARAM_KEY,
+                                getRealCallerPackageName(uri))
                         .build(), corpUserId);
 
         // TODO Make sure it doesn't leak any FDs.
