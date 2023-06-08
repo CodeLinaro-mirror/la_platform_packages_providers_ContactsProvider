@@ -32,6 +32,7 @@ import android.annotation.Nullable;
 import android.annotation.SuppressLint;
 import android.annotation.WorkerThread;
 import android.app.AppOpsManager;
+import android.app.BroadcastOptions;
 import android.app.SearchManager;
 import android.content.BroadcastReceiver;
 import android.content.ContentProviderOperation;
@@ -139,6 +140,7 @@ import android.util.SparseArray;
 import com.android.common.content.ProjectionMap;
 import com.android.common.content.SyncStateContentProviderHelper;
 import com.android.common.io.MoreCloseables;
+import com.android.internal.R;
 import com.android.internal.annotations.GuardedBy;
 import com.android.internal.config.appcloning.AppCloningDeviceConfigHelper;
 import com.android.internal.util.ArrayUtils;
@@ -2193,16 +2195,17 @@ public class ContactsProvider2 extends AbstractContactsProvider
     }
 
     /**
-     * Returned whether the feature flag for contacts sharing for clone profile is set. If true,
-     * the clone contacts provider would use the parent contacts providers contacts data to serve
-     * its requests.
+     * Returns whether contacts sharing is enabled allowing the clone contacts provider to use the
+     * parent contacts providers contacts data to serve its requests. The method returns true if
+     * the device supports clone profile contacts sharing and the feature flag for the same is
+     * turned on.
+     *
      * @return true/false if contact sharing is enabled/disabled
      */
     @VisibleForTesting
     protected boolean isContactSharingEnabledForCloneProfile() {
-        // TODO(b/253449368): This method should also check for the config controlling
-        // all app-cloning features.
-        return mAppCloningDeviceConfigHelper.getEnableAppCloningBuildingBlocks();
+        return getContext().getResources().getBoolean(R.bool.config_enableAppCloningBuildingBlocks)
+                && mAppCloningDeviceConfigHelper.getEnableAppCloningBuildingBlocks();
     }
 
     /**
@@ -2472,6 +2475,17 @@ public class ContactsProvider2 extends AbstractContactsProvider
         }
     }
 
+    private void notifySimAccountsChanged() {
+        // This allows us to discard older broadcasts still waiting to be delivered.
+        final Bundle options = BroadcastOptions.makeBasic()
+                .setDeliveryGroupPolicy(BroadcastOptions.DELIVERY_GROUP_POLICY_MOST_RECENT)
+                .setDeferralPolicy(BroadcastOptions.DEFERRAL_POLICY_UNTIL_ACTIVE)
+                .toBundle();
+
+        getContext().sendBroadcast(new Intent(SimContacts.ACTION_SIM_ACCOUNTS_CHANGED), null,
+                options);
+    }
+
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
         waitForAccess(mReadAccessLatch);
@@ -2529,7 +2543,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             } finally {
                 db.endTransaction();
             }
-            getContext().sendBroadcast(new Intent(SimContacts.ACTION_SIM_ACCOUNTS_CHANGED));
+            notifySimAccountsChanged();
             return response;
         } else if (SimContacts.REMOVE_SIM_ACCOUNT_METHOD.equals(method)) {
             ContactsPermissions.enforceCallingOrSelfPermission(getContext(),
@@ -2549,7 +2563,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             } finally {
                 db.endTransaction();
             }
-            getContext().sendBroadcast(new Intent(SimContacts.ACTION_SIM_ACCOUNTS_CHANGED));
+            notifySimAccountsChanged();
             return response;
         } else if (SimContacts.QUERY_SIM_ACCOUNTS_METHOD.equals(method)) {
             ContactsPermissions.enforceCallingOrSelfPermission(getContext(), READ_PERMISSION);
