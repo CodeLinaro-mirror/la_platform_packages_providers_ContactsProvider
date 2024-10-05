@@ -16,10 +16,16 @@
 
 package com.android.providers.contacts;
 
+import static android.provider.ContactsContract.SimAccount.SDN_EF_TYPE;
+
+import static org.mockito.ArgumentMatchers.argThat;
+
 import android.accounts.Account;
+import android.accounts.AccountManager;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
 import android.platform.test.annotations.EnableFlags;
 import android.platform.test.flag.junit.SetFlagsRule;
 import android.provider.ContactsContract.CommonDataKinds.GroupMembership;
@@ -41,8 +47,12 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import org.mockito.Mockito;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -64,6 +74,8 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
     static final Account SOURCE_ACCOUNT = new Account("sourceName", "sourceType");
     static final Account DEST_ACCOUNT = new Account("destName", "destType");
     static final Account DEST_ACCOUNT_WITH_SOURCE_TYPE = new Account("destName", "sourceType");
+    static final Account DEST_CLOUD_ACCOUNT = new Account("destName", "com.google");
+    static final Account SIM_ACCOUNT = new Account("simName", "simType");
 
     static final String SOURCE_ID = "uniqueSourceId";
 
@@ -74,7 +86,11 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
     ContactsProvider2 mCp;
     AccountWithDataSet mSource;
     AccountWithDataSet mDest;
+    AccountWithDataSet mCloudDest;
+    AccountWithDataSet mSimAcct;
     ContactMover mMover;
+    DefaultAccountManager mDefaultAccountManager;
+    AccountManager mMockAccountManager;
 
     @Before
     @Override
@@ -82,17 +98,69 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
         super.setUp();
 
         mCp = (ContactsProvider2) getProvider();
+        mMockAccountManager = Mockito.mock(AccountManager.class);
+        mDefaultAccountManager = new DefaultAccountManager(mCp.getContext(),
+                mCp.getDatabaseHelper(), new SyncSettingsHelper(), mMockAccountManager);
         mActor.setAccounts(new Account[]{SOURCE_ACCOUNT, DEST_ACCOUNT});
         mSource = AccountWithDataSet.get(SOURCE_ACCOUNT.name, SOURCE_ACCOUNT.type, null);
         mDest = AccountWithDataSet.get(DEST_ACCOUNT.name, DEST_ACCOUNT.type, null);
-        mMover = new ContactMover(mCp, mCp.getDatabaseHelper());
+        mCloudDest = AccountWithDataSet.get(
+                DEST_CLOUD_ACCOUNT.name, DEST_CLOUD_ACCOUNT.type, null);
+        DefaultAccountManager.setEligibleSystemCloudAccountTypesForTesting(new String[]{
+                DEST_CLOUD_ACCOUNT.type,
+        });
 
+        mMover = new ContactMover(mCp, mCp.getDatabaseHelper(), mDefaultAccountManager);
+        mSimAcct = createSimAccount(SIM_ACCOUNT);
     }
 
     @After
     @Override
     public void tearDown() throws Exception {
         super.tearDown();
+    }
+
+    private AccountWithDataSet createSimAccount(Account account) {
+        AccountWithDataSet accountWithDataSet =
+                new AccountWithDataSet(account.name, account.type, null);
+        final SQLiteDatabase db = mCp.getDatabaseHelper().getWritableDatabase();
+        db.beginTransaction();
+        try {
+            mCp.getDatabaseHelper()
+                    .createSimAccountIdInTransaction(accountWithDataSet, 1, SDN_EF_TYPE);
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+        return accountWithDataSet;
+    }
+
+    private void setDefaultAccountManagerAccounts(Account[] accounts) {
+        Mockito.when(mMockAccountManager.getAccounts()).thenReturn(accounts);
+
+        // Constructs a map between the account type and account list, so that we could mock
+        // mMockAccountManager.getAccountsByType below.
+        Map<String, List<Account>> accountTypeMap = new HashMap<>();
+        for (Account account : accounts) {
+            if (accountTypeMap.containsKey(account.type)) {
+                accountTypeMap.get(account.type).add(account);
+            } else {
+                List<Account> accountList = new ArrayList<>();
+                accountList.add(account);
+                accountTypeMap.put(account.type, accountList);
+            }
+        }
+
+        // By default: getAccountsByType returns empty account list unless there is a match in
+        // in accountTypeMap.
+        Mockito.when(mMockAccountManager.getAccountsByType(
+                argThat(str -> !accountTypeMap.containsKey(str)))).thenReturn(new Account[0]);
+
+        for (Map.Entry<String, List<Account>> entry : accountTypeMap.entrySet()) {
+            String accountType = entry.getKey();
+            Mockito.when(mMockAccountManager.getAccountsByType(accountType)).thenReturn(
+                    entry.getValue().toArray(new Account[0]));
+        }
     }
 
     private void assertMovedContactIsDeleted(long rawContactId,
@@ -333,7 +401,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 DEST_ACCOUNT);
 
         // trigger the move
-        mMover.moveRawContacts(mSource, mDest);
+        mMover.moveRawContacts(Set.of(mSource), mDest);
 
         // verify the duplicate raw contact in dest has been deleted in place
         assertMovedContactIsDeleted(sourceDupeRawContactId, mSource);
@@ -357,7 +425,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
         DataUtil.insertStructuredName(mResolver, destRawContactId2, "firstB", "lastB");
 
         // trigger the move
-        mMover.moveRawContacts(mSource, mDest);
+        mMover.moveRawContacts(Set.of(mSource), mDest);
 
         // Verify no stub was written since no source ID existed
         assertMoveStubDoesNotExist(sourceRawContactId, mSource);
@@ -382,7 +450,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 "Foo", "Bar", SOURCE_ID, SOURCE_ACCOUNT);
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(mSource, mDest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(mSource), mDest);
 
         // verify the unique raw contact has been moved from the old -> new account
         assertMovedRawContact(uniqueContactId, mDest, true);
@@ -406,7 +474,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 "Foo", "Bar", SOURCE_ID, SOURCE_ACCOUNT);
 
         // trigger the move
-        mMover.moveRawContacts(mSource, mDest);
+        mMover.moveRawContacts(Set.of(mSource), mDest);
 
         // verify the unique raw contact has been moved from the old -> new account
         assertMovedRawContact(uniqueContactId, mDest, true);
@@ -434,7 +502,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 "Foo", "Bar", SOURCE_ID, /* account= */ null);
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(source, mDest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(source), mDest);
 
         // verify the unique raw contact has been moved from the old -> new account
         assertMovedRawContact(uniqueContactId, mDest, true);
@@ -465,7 +533,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 "Foo", "Bar", SOURCE_ID, /* account= */ null);
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(source, mDest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(source), mDest);
 
         // verify the unique raw contact has been moved from the old -> new account
         assertMovedRawContact(uniqueContactId, mDest, true);
@@ -493,7 +561,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 "Foo", "Bar", SOURCE_ID, SOURCE_ACCOUNT);
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(mSource, dest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(mSource), dest);
 
         // verify the unique raw contact has been moved from the old -> new account
         assertMovedRawContact(uniqueContactId, dest, true);
@@ -514,7 +582,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 "Foo", "Bar", SOURCE_ID, SOURCE_ACCOUNT);
 
         // trigger the move
-        mMover.moveRawContacts(mSource, dest);
+        mMover.moveRawContacts(Set.of(mSource), dest);
 
         // verify the unique raw contact has been moved from the old -> new account
         assertMovedRawContact(uniqueContactId, dest, true);
@@ -542,7 +610,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
         DataUtil.insertStructuredName(mResolver, destRawContactId, "firstA", "lastA");
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(mSource, mDest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(mSource), mDest);
 
         // Verify no stub was written since no source ID existed
         assertMoveStubDoesNotExist(sourceRawContactId, mSource);
@@ -587,7 +655,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
         DataUtil.insertStructuredName(mResolver, destRawContactId, "firstA", "lastA");
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(mSource, dest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(mSource), dest);
 
         // Verify no stub was written since no source ID existed
         assertMoveStubDoesNotExist(sourceRawContactId, mSource);
@@ -632,7 +700,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
         insertNonPortableData(mResolver, destRawContactId, "foo");
 
         // trigger the move
-        mMover.moveRawContacts(mSource, dest);
+        mMover.moveRawContacts(Set.of(mSource), dest);
 
         // verify the duplicate contact has been deleted
         assertMovedContactIsDeleted(sourceRawContactId, mSource);
@@ -661,7 +729,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 "groupTitleRes", List.of(destDupeRawContactId));
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(mSource, mDest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(mSource), mDest);
 
         // verify the duplicate raw contact in dest has been deleted in place instead of creating
         // a stub (because this is a duplicate non-system group, we delete in-place even if there's
@@ -686,7 +754,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
 
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(mSource, mDest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(mSource), mDest);
 
         // verify group and contact have been moved from the source account to the dest account
         assertMovedRawContact(sourceRawContactId, mDest, false);
@@ -714,7 +782,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
 
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(mSource, mDest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(mSource), mDest);
 
         // verify group and contact have been moved from the source account to the dest account
         assertMovedRawContact(sourceRawContactId, mDest, false);
@@ -736,7 +804,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
 
 
         // trigger the move
-        mMover.moveRawContacts(mSource, mDest);
+        mMover.moveRawContacts(Set.of(mSource), mDest);
 
         // verify group and contact have been moved from the source account to the dest account
         assertMovedRawContact(sourceRawContactId, mDest, false);
@@ -777,7 +845,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 List.of(destRawContactId2));
 
         // trigger the move
-        mMover.moveRawContactsWithSyncStubs(mSource, mDest);
+        mMover.moveRawContactsWithSyncStubs(Set.of(mSource), mDest);
 
         // Verify no stub was written since no source ID existed
         assertMoveStubDoesNotExist(sourceRawContactId, mSource);
@@ -812,7 +880,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 "groupTitleRes", List.of(destDupeRawContactId));
 
         // trigger the move
-        mMover.moveRawContacts(mSource, mDest);
+        mMover.moveRawContacts(Set.of(mSource), mDest);
 
         // verify the duplicate raw contact in dest has been deleted in place
         assertMovedContactIsDeleted(sourceDupeRawContactId, mSource);
@@ -840,7 +908,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
         setGroupSourceId(sourceGroup, SOURCE_ID);
 
         // trigger the move
-        mMover.moveRawContacts(mSource, mDest);
+        mMover.moveRawContacts(Set.of(mSource), mDest);
 
         // verify the duplicate raw contact in dest has been deleted in place
         assertMovedRawContact(sourceRawContactId, mDest, false);
@@ -864,7 +932,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
         promoteToSystemGroup(sourceGroup, null, true);
 
         // trigger the move
-        mMover.moveRawContacts(mSource, mDest);
+        mMover.moveRawContacts(Set.of(mSource), mDest);
 
         // since sourceGroup is a system group, it cannot be deleted
         assertGroup(sourceGroup, mSource, Set.of());
@@ -904,7 +972,7 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                 });
 
         // trigger the move
-        mMover.moveRawContacts(mSource, mDest);
+        mMover.moveRawContacts(Set.of(mSource), mDest);
 
         // since sourceGroup is a system group, it cannot be deleted
         assertGroup(sourceGroup, mSource, Set.of());
@@ -924,5 +992,160 @@ public class MoveRawContactsTest extends BaseContactsProvider2Test {
                         "groupTitle",
                         "groupTitleRes"
                 }));
+    }
+
+    @Test
+    @EnableFlags({Flags.FLAG_CP2_ACCOUNT_MOVE_FLAG})
+    public void testMoveLocalToDefaultCloudAccount() {
+        mActor.setAccounts(new Account[]{DEST_CLOUD_ACCOUNT});
+        setDefaultAccountManagerAccounts(new Account[]{
+                DEST_CLOUD_ACCOUNT,
+        });
+        mDefaultAccountManager.tryPushDefaultAccount(DefaultAccount.ofCloud(DEST_CLOUD_ACCOUNT));
+
+        // create a unique contact in the (null/local) source account
+        long uniqueContactId = createStarredRawContactForMove(
+                "Foo", "Bar",  /* sourceId= */ null, /* account= */ null);
+
+        // trigger the move
+        mMover.moveLocalToCloudDefaultAccount();
+
+        // verify the unique raw contact has been moved from the old -> new account
+        assertMovedRawContact(uniqueContactId, mCloudDest, true);
+    }
+
+    @Test
+    @EnableFlags({Flags.FLAG_CP2_ACCOUNT_MOVE_FLAG})
+    public void testMoveToDefaultNonCloudAccount() {
+        mActor.setAccounts(new Account[]{DEST_ACCOUNT});
+        AccountWithDataSet source =
+                AccountWithDataSet.get(null, null, null);
+        setDefaultAccountManagerAccounts(new Account[]{
+                DEST_ACCOUNT,
+        });
+        mDefaultAccountManager.tryPushDefaultAccount(DefaultAccount.ofCloud(DEST_ACCOUNT));
+
+        // create a unique contact in the (null/local) source account
+        long uniqueContactId = createStarredRawContactForMove(
+                "Foo", "Bar", /* sourceId= */ null, /* account= */ null);
+
+        // trigger the move
+        mMover.moveLocalToCloudDefaultAccount();
+
+        // verify the unique raw contact has *not* been moved
+        assertMovedRawContact(uniqueContactId, source, true);
+    }
+
+    @Test
+    @EnableFlags({Flags.FLAG_CP2_ACCOUNT_MOVE_FLAG})
+    public void testMoveFromNonLocalAccount() {
+        mActor.setAccounts(new Account[]{SOURCE_ACCOUNT, DEST_CLOUD_ACCOUNT});
+        setDefaultAccountManagerAccounts(new Account[]{
+                SOURCE_ACCOUNT,
+                DEST_ACCOUNT,
+        });
+        mDefaultAccountManager.tryPushDefaultAccount(DefaultAccount.ofCloud(DEST_ACCOUNT));
+
+        // create a unique contact in the source account
+        long uniqueContactId = createStarredRawContactForMove(
+                "Foo", "Bar", /* sourceId= */ null, SOURCE_ACCOUNT);
+
+        // trigger the move
+        mMover.moveLocalToCloudDefaultAccount();
+
+        // verify the unique raw contact has *not* been moved
+        assertMovedRawContact(uniqueContactId, mSource, true);
+    }
+
+    @Test
+    @EnableFlags({Flags.FLAG_CP2_ACCOUNT_MOVE_FLAG})
+    public void testMoveSimToDefaultCloudAccount() {
+        mActor.setAccounts(new Account[]{SIM_ACCOUNT, DEST_CLOUD_ACCOUNT});
+
+        setDefaultAccountManagerAccounts(new Account[]{
+                SIM_ACCOUNT,
+                DEST_CLOUD_ACCOUNT,
+        });
+        mDefaultAccountManager.tryPushDefaultAccount(DefaultAccount.ofCloud(DEST_CLOUD_ACCOUNT));
+
+        // create a unique contact in the (null/local) source account
+        long uniqueContactId = createStarredRawContactForMove(
+                "Foo", "Bar",  /* sourceId= */ null, /* account= */ SIM_ACCOUNT);
+
+        // trigger the move
+        mMover.moveSimToCloudDefaultAccount();
+
+        // verify the unique raw contact has been moved from the old -> new account
+        assertMovedRawContact(uniqueContactId, mCloudDest, true);
+    }
+
+    @Test
+    @EnableFlags({Flags.FLAG_CP2_ACCOUNT_MOVE_FLAG})
+    public void testGetNumberContactsWithSimContacts() {
+        mActor.setAccounts(new Account[]{SIM_ACCOUNT, DEST_CLOUD_ACCOUNT});
+
+        setDefaultAccountManagerAccounts(new Account[]{
+                SIM_ACCOUNT,
+                DEST_CLOUD_ACCOUNT,
+        });
+        mDefaultAccountManager.tryPushDefaultAccount(DefaultAccount.ofCloud(DEST_CLOUD_ACCOUNT));
+
+        // create a unique contact in a sim account
+        createStarredRawContactForMove(
+                "Foo", "Bar",  /* sourceId= */ null, /* account= */ SIM_ACCOUNT);
+        // create a unique contact in a non-sim account
+        createStarredRawContactForMove(
+                "Bar", "Baz",  /* sourceId= */ null, /* account= */ DEST_CLOUD_ACCOUNT);
+
+        // get the counts
+        int localCount = mMover.getNumberLocalContacts();
+        int simCount = mMover.getNumberSimContacts();
+
+        // only contact is in the sim count
+        assertEquals(1, simCount);
+        assertEquals(0, localCount);
+    }
+
+    @Test
+    @EnableFlags({Flags.FLAG_CP2_ACCOUNT_MOVE_FLAG})
+    public void testGetNumberContactsWithLocalContacts() {
+        mActor.setAccounts(new Account[]{DEST_CLOUD_ACCOUNT});
+        setDefaultAccountManagerAccounts(new Account[]{
+                DEST_CLOUD_ACCOUNT,
+        });
+        mDefaultAccountManager.tryPushDefaultAccount(DefaultAccount.ofCloud(DEST_CLOUD_ACCOUNT));
+
+        // create a unique contact in the (null/local) source account
+        createStarredRawContactForMove(
+                "Foo", "Bar",  /* sourceId= */ null, /* account= */ null);
+
+        // trigger the move
+        int localCount = mMover.getNumberLocalContacts();
+        int simCount = mMover.getNumberSimContacts();
+
+        // only contact is in the local count
+        assertEquals(1, localCount);
+        assertEquals(0, simCount);
+    }
+
+    @Test
+    @EnableFlags({Flags.FLAG_CP2_ACCOUNT_MOVE_FLAG})
+    public void testGetNumberContactsWithoutCloudAccount() {
+        mActor.setAccounts(new Account[]{SIM_ACCOUNT});
+
+        setDefaultAccountManagerAccounts(new Account[]{SIM_ACCOUNT});
+        // create a unique contact in the sim and local source accounts
+        createStarredRawContactForMove(
+                "Foo", "Bar",  /* sourceId= */ null, /* account= */ SIM_ACCOUNT);
+        createStarredRawContactForMove(
+                "Bar", "Baz",  /* sourceId= */ null, /* account= */ null);
+
+        // trigger the move
+        int localCount = mMover.getNumberLocalContacts();
+        int simCount = mMover.getNumberSimContacts();
+
+        // no movable contacts without a Cloud Default Account
+        assertEquals(0, localCount);
+        assertEquals(0, simCount);
     }
 }
