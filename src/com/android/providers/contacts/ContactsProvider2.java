@@ -23,6 +23,7 @@ import static android.provider.Flags.newDefaultAccountApiEnabled;
 
 import static com.android.providers.contacts.flags.Flags.cp2SyncSearchIndexFlag;
 import static com.android.providers.contacts.flags.Flags.disableCp2AccountMoveFlag;
+import static com.android.providers.contacts.flags.Flags.logCallMethod;
 import static com.android.providers.contacts.util.PhoneAccountHandleMigrationUtils.TELEPHONY_COMPONENT_NAME;
 
 import android.accounts.Account;
@@ -2519,6 +2520,9 @@ public class ContactsProvider2 extends AbstractContactsProvider
             return Bundle.EMPTY;
         }
         switchToContactMode();
+
+        boolean enableCallMethodLogging = logCallMethod();
+
         if (Authorization.AUTHORIZATION_METHOD.equals(method)) {
             Uri uri = extras.getParcelable(Authorization.KEY_URI_TO_AUTHORIZE);
 
@@ -2612,49 +2616,113 @@ public class ContactsProvider2 extends AbstractContactsProvider
             return response;
         } else if (DefaultAccount.QUERY_DEFAULT_ACCOUNT_FOR_NEW_CONTACTS_METHOD.equals(
                 method)) {
-            if (newDefaultAccountApiEnabled()) {
-                return queryDefaultAccountForNewContacts();
-            } else {
-                // Ignore the call if the flag is disabled.
-                Log.w(TAG, "Query default account for new contacts is not supported.");
+            final LogFields.Builder logBuilder =
+                    enableCallMethodLogging ? getCallMethodLogBuilder()
+                            .setMethodCalled(
+                                    LogUtils.MethodCall.GET_DEFAULT_ACCOUNT_FOR_NEW_CONTACTS)
+                            : null;
+            try {
+                if (newDefaultAccountApiEnabled()) {
+                    return queryDefaultAccountForNewContacts();
+                } else {
+                    throw new UnsupportedOperationException(
+                            "Query default account for new contacts is not supported.");
+                }
+            } catch (Exception e) {
+                if (enableCallMethodLogging) {
+                    logBuilder.setException(e);
+                }
+                throw e;
+            } finally {
+                if (enableCallMethodLogging) {
+                    LogUtils.log(logBuilder.build());
+                }
             }
         } else if (DefaultAccount.QUERY_ELIGIBLE_DEFAULT_ACCOUNTS_METHOD.equals(method)) {
-            if (newDefaultAccountApiEnabled()) {
-                return queryEligibleDefaultAccounts();
-            } else {
-                Log.w(TAG, "Query eligible account that can be set as cloud default account "
-                        + "is not supported.");
+            final LogFields.Builder logBuilder =
+                    enableCallMethodLogging ? getCallMethodLogBuilder()
+                            .setMethodCalled(LogUtils.MethodCall.GET_ELIGIBLE_CLOUD_ACCOUNTS)
+                            : null;
+            try {
+                if (newDefaultAccountApiEnabled()) {
+                    return queryEligibleDefaultAccounts();
+                } else {
+                    throw new UnsupportedOperationException(
+                            "Query eligible account that can be set as cloud default account "
+                                    + "is not supported.");
+                }
+            } catch (Exception e) {
+                if (enableCallMethodLogging) {
+                    logBuilder.setException(e);
+                }
+                throw e;
+            } finally {
+                if (enableCallMethodLogging) {
+                    LogUtils.log(logBuilder.build());
+                }
             }
         } else if (Settings.SET_DEFAULT_ACCOUNT_METHOD.equals(method)) {
             return setDefaultAccountSetting(extras);
         } else if (DefaultAccount.SET_DEFAULT_ACCOUNT_FOR_NEW_CONTACTS_METHOD.equals(
                 method)) {
-            if (newDefaultAccountApiEnabled()) {
-                return setDefaultAccountForNewContactsSetting(extras);
-            } else {
-                // Ignore the call if the flag is disabled.
-                Log.w(TAG, "Set default account for new contacts is not supported.");
+            final LogFields.Builder logBuilder =
+                    enableCallMethodLogging ? getCallMethodLogBuilder()
+                            .setMethodCalled(
+                                    LogUtils.MethodCall.SET_DEFAULT_ACCOUNT_FOR_NEW_CONTACTS)
+                            : null;
+            try {
+                if (newDefaultAccountApiEnabled()) {
+                    return setDefaultAccountForNewContactsSetting(extras);
+                } else {
+                    throw new UnsupportedOperationException(
+                            "Set default account for new contacts is not supported.");
+                }
+            } catch (Exception e) {
+                if (enableCallMethodLogging) {
+                    logBuilder.setException(e);
+                }
+                throw e;
+            } finally {
+                if (enableCallMethodLogging) {
+                    LogUtils.log(logBuilder.build());
+                }
             }
         } else if (RawContacts.DefaultAccount.MOVE_LOCAL_CONTACTS_TO_CLOUD_DEFAULT_ACCOUNT_METHOD
                 .equals(method)) {
-            if (!newDefaultAccountApiEnabled() || disableCp2AccountMoveFlag()) {
-                return null;
+            final LogFields.Builder logBuilder =
+                    enableCallMethodLogging ? getCallMethodLogBuilder()
+                            .setMethodCalled(
+                                    LogUtils.MethodCall.MOVE_LOCAL_CONTACTS_TO_DEFAULT_ACCOUNT)
+                            : null;
+            try {
+                if (!newDefaultAccountApiEnabled() || disableCp2AccountMoveFlag()) {
+                    throw new UnsupportedOperationException(
+                            "Move local contacts to cloud default account is not supported");
+                }
+                ContactsPermissions.enforceCallingOrSelfPermission(getContext(), WRITE_PERMISSION);
+                ContactsPermissions.enforceCallingOrSelfPermission(getContext(),
+                        SET_DEFAULT_ACCOUNT_PERMISSION);
+                final Bundle response = new Bundle();
+                mContactMover.moveLocalToCloudDefaultAccount();
+                return response;
+            } catch (Exception e) {
+                if (enableCallMethodLogging) {
+                    logBuilder.setException(e);
+                }
+                throw e;
+            } finally {
+                if (enableCallMethodLogging) {
+                    LogUtils.log(logBuilder.build());
+                }
             }
-            ContactsPermissions.enforceCallingOrSelfPermission(getContext(), WRITE_PERMISSION);
-            ContactsPermissions.enforceCallingOrSelfPermission(getContext(),
-                    SET_DEFAULT_ACCOUNT_PERMISSION);
-            final Bundle response = new Bundle();
-            mContactMover.moveLocalToCloudDefaultAccount();
-            return response;
-
         } else if (RawContacts.DefaultAccount.GET_NUMBER_OF_MOVABLE_LOCAL_CONTACTS_METHOD
                 .equals(method)) {
             if (!newDefaultAccountApiEnabled()) {
-                Log.w(TAG, "Flag newDefaultAccountApiEnabled disabled");
-                return null;
+                throw new UnsupportedOperationException(
+                        "Getting the count of local contacts to move is not supported");
             }
             if (disableCp2AccountMoveFlag()) {
-              Log.w(TAG, "Cp2AccountMoveFlag disabled");
+                Log.w(TAG, "Cp2AccountMoveFlag disabled");
                 return new Bundle();
             }
             ContactsPermissions.enforceCallingOrSelfPermission(getContext(), READ_PERMISSION);
@@ -2665,23 +2733,39 @@ public class ContactsProvider2 extends AbstractContactsProvider
             response.putInt(RawContacts.DefaultAccount.KEY_NUMBER_OF_MOVABLE_LOCAL_CONTACTS,
                     count);
             return response;
-
         } else if (RawContacts.DefaultAccount.MOVE_SIM_CONTACTS_TO_CLOUD_DEFAULT_ACCOUNT_METHOD
                 .equals(method)) {
-            if (!newDefaultAccountApiEnabled() || disableCp2AccountMoveFlag()) {
-                return null;
+            final LogFields.Builder logBuilder =
+                    enableCallMethodLogging ? getCallMethodLogBuilder()
+                            .setMethodCalled(
+                                    LogUtils.MethodCall.MOVE_SIM_CONTACTS_TO_DEFAULT_ACCOUNT)
+                            : null;
+            try {
+                if (!newDefaultAccountApiEnabled() || disableCp2AccountMoveFlag()) {
+                    throw new UnsupportedOperationException(
+                            "Move SIM contacts to cloud default account is not supported");
+                }
+                ContactsPermissions.enforceCallingOrSelfPermission(getContext(), WRITE_PERMISSION);
+                ContactsPermissions.enforceCallingOrSelfPermission(getContext(),
+                        SET_DEFAULT_ACCOUNT_PERMISSION);
+                final Bundle response = new Bundle();
+                mContactMover.moveSimToCloudDefaultAccount();
+                return response;
+            } catch (Exception e) {
+                if (enableCallMethodLogging) {
+                    logBuilder.setException(e);
+                }
+                throw e;
+            } finally {
+                if (enableCallMethodLogging) {
+                    LogUtils.log(logBuilder.build());
+                }
             }
-            ContactsPermissions.enforceCallingOrSelfPermission(getContext(), WRITE_PERMISSION);
-            ContactsPermissions.enforceCallingOrSelfPermission(getContext(),
-                    SET_DEFAULT_ACCOUNT_PERMISSION);
-            final Bundle response = new Bundle();
-            mContactMover.moveSimToCloudDefaultAccount();
-            return response;
-
         } else if (RawContacts.DefaultAccount.GET_NUMBER_OF_MOVABLE_SIM_CONTACTS_METHOD
                 .equals(method)) {
             if (!newDefaultAccountApiEnabled()) {
-                return null;
+                throw new UnsupportedOperationException(
+                        "Getting the count of SIM contacts to move is not supported");
             }
             if (disableCp2AccountMoveFlag()) {
                 return new Bundle();
@@ -2694,9 +2778,15 @@ public class ContactsProvider2 extends AbstractContactsProvider
             response.putInt(RawContacts.DefaultAccount.KEY_NUMBER_OF_MOVABLE_SIM_CONTACTS,
                     count);
             return response;
-
         }
         return null;
+    }
+
+    private static LogFields.Builder getCallMethodLogBuilder() {
+        return LogFields.Builder.aLogFields()
+                .setApiType(LogUtils.ApiType.CALL)
+                .setStartNanos(SystemClock.elapsedRealtimeNanos())
+                .setUid(Binder.getCallingUid());
     }
 
     private @NonNull Bundle queryDefaultAccountForNewContacts() {
@@ -4918,12 +5008,12 @@ public class ContactsProvider2 extends AbstractContactsProvider
                         ? updatedDataSet : c.getString(GroupAccountQuery.DATA_SET);
 
                 if (isAccountChanging) {
-                    if (newDefaultAccountApiEnabled() && isAccountRestrictionEnabled()
-                            && CompatChanges.isChangeEnabled(
-                            ChangeIds.RESTRICT_CONTACTS_CREATION_IN_ACCOUNTS,
-                            Binder.getCallingUid())) {
+                    if (newDefaultAccountApiEnabled() && isAccountRestrictionEnabled()) {
                         mAccountResolver.validateAccountForContactAddition(updatedAccountName,
-                                updatedAccountType);
+                                updatedAccountType,
+                                CompatChanges.isChangeEnabled(
+                                        ChangeIds.RESTRICT_CONTACTS_CREATION_IN_ACCOUNTS,
+                                        Binder.getCallingUid()));
                     }
 
                     final long accountId = dbHelper.getOrCreateAccountIdInTransaction(
@@ -5108,13 +5198,13 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 // a single transaction, failing checkAccountIsWritable will fail the entire update
                 // operation, which is clean such that no partial updated will be committed to the
                 // DB.
-                if (applyDefaultAccount && isAccountRestrictionEnabled()
-                        && CompatChanges.isChangeEnabled(
-                                ChangeIds.RESTRICT_CONTACTS_CREATION_IN_ACCOUNTS,
-                                Binder.getCallingUid())) {
+                if (applyDefaultAccount && isAccountRestrictionEnabled()) {
                     mAccountResolver.validateAccountForContactAddition(
                             newAccountWithDataSet.getAccountName(),
-                            newAccountWithDataSet.getAccountType());
+                            newAccountWithDataSet.getAccountType(),
+                            CompatChanges.isChangeEnabled(
+                                    ChangeIds.RESTRICT_CONTACTS_CREATION_IN_ACCOUNTS,
+                                    Binder.getCallingUid()));
                 }
 
                 accountId = dbHelper.getOrCreateAccountIdInTransaction(newAccountWithDataSet);
