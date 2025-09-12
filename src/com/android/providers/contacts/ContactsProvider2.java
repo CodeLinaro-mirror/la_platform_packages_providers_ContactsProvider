@@ -1647,14 +1647,16 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
         mContactDirectoryManager = new ContactDirectoryManager(this);
         mGlobalSearchSupport = new GlobalSearchSupport(this);
-        mDefaultAccountManager = new DefaultAccountManager(getContext(), mContactsHelper);
-        AccountManager accountManager = AccountManager.get(getContext());
-        mAccountResolver = new AccountResolver(mContactsHelper, mDefaultAccountManager,
-                accountManager);
 
         mAccountAttributesEvaluator = new AccountAttributesEvaluator(getContext(), mContactsHelper);
         mAccountAttributesManager = new AccountAttributesManager(mContactsHelper,
                 mAccountAttributesEvaluator);
+        mDefaultAccountManager = new DefaultAccountManager(getContext(), mContactsHelper,
+                mAccountAttributesManager);
+        AccountManager accountManager = AccountManager.get(getContext());
+        mAccountResolver = new AccountResolver(mContactsHelper, mDefaultAccountManager,
+                accountManager);
+
         mContactMover = new ContactMover(this, mContactsHelper, mDefaultAccountManager);
 
         if (mContactsHelper.getPhoneAccountHandleMigrationUtils()
@@ -2231,6 +2233,11 @@ public class ContactsProvider2 extends AbstractContactsProvider
     @VisibleForTesting
     /* package */ PhotoStore getProfilePhotoStore() {
         return mProfilePhotoStore;
+    }
+
+    @VisibleForTesting
+    /* package*/ AccountAttributesManager getAccountAttributesManager() {
+        return mAccountAttributesManager;
     }
 
     /**
@@ -2864,6 +2871,36 @@ public class ContactsProvider2 extends AbstractContactsProvider
             Account[] systemAccounts = AccountManager.get(getContext()).getAccounts();
             mAccountAttributesManager.updateAccountAttributes(accountWithDataSet,
                     extras.getLong(Settings.KEY_ACCOUNT_ATTRIBUTES), systemAccounts);
+            return new Bundle();
+        } else if (Settings.RESET_ACCOUNT_ATTRIBUTES_METHOD.equals(method)) {
+            if (!newAccountAttributesApiEnabled()) {
+                throw new UnsupportedOperationException(
+                        "Resetting account attributes is not supported");
+            }
+            ContactsPermissions.enforceCallingOrSelfPermission(getContext(), WRITE_PERMISSION);
+
+            String accountName = extras.getString(Settings.ACCOUNT_NAME);
+            String accountType = extras.getString(Settings.ACCOUNT_TYPE);
+            String dataSet = extras.getString(Settings.DATA_SET);
+
+            if (!isCalledByAuthenticator(getCallingPackage(), accountType)) {
+                throw new SecurityException(String.format(
+                        "Cannot reset account attributes: The calling package %s is not the "
+                                + "authenticator for this account.",
+                        getCallingPackage()));
+            }
+
+            AccountWithDataSet accountWithDataSet = new AccountWithDataSet(accountName, accountType,
+                    dataSet);
+            Account[] systemAccounts = AccountManager.get(getContext()).getAccounts();
+
+            boolean isSystemOrLocalAccount =
+                    accountWithDataSet.isLocalAccount() || accountWithDataSet.inSystemAccounts(
+                            systemAccounts);
+
+            mAccountAttributesManager.initializeAccountAttributes(accountWithDataSet,
+                    isSystemOrLocalAccount);
+
             return new Bundle();
         }
         return null;
