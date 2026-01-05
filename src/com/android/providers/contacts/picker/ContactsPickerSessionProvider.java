@@ -16,12 +16,8 @@
 
 package com.android.providers.contacts.picker;
 
-import android.app.job.JobInfo;
-import android.app.job.JobScheduler;
-import android.content.ComponentName;
 import android.content.ContentProvider;
 import android.content.ContentValues;
-import android.content.Context;
 import android.content.UriMatcher;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
@@ -33,11 +29,10 @@ import android.provider.ContactsPickerSessionContract;
 import android.text.TextUtils;
 import android.util.Log;
 
+import com.android.internal.annotations.VisibleForTesting;
 import com.android.providers.contacts.picker.ContactsPickerDatabaseHelper.SessionColumns;
 import com.android.providers.contacts.picker.ContactsPickerDatabaseHelper.Tables;
-import com.android.providers.contacts.picker.ContactsPickerWorkScheduler;
 
-import java.util.Arrays;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -49,7 +44,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>Sessions older than 24 hours are automatically cleaned up by a daily job.
  */
-public final class ContactsPickerSessionProvider extends ContentProvider {
+public class ContactsPickerSessionProvider extends ContentProvider {
 
     private static final String TAG = "ContactsPickerSession";
     private static final boolean VERBOSE_LOGGING = Log.isLoggable(TAG, Log.VERBOSE);
@@ -71,7 +66,13 @@ public final class ContactsPickerSessionProvider extends ContentProvider {
     @Override
     public boolean onCreate() {
         mDatabaseHelper = ContactsPickerDatabaseHelper.getInstance(getContext());
+        scheduleCleanupJob();
         return true;
+    }
+
+    @VisibleForTesting
+    protected void scheduleCleanupJob() {
+        ContactsPickerJobScheduler.scheduleCleanupJob(getContext());
     }
 
     @Override
@@ -89,12 +90,17 @@ public final class ContactsPickerSessionProvider extends ContentProvider {
 
         final String sessionUid = UUID.randomUUID().toString();
 
+        // App A (Picker) inserts the session on behalf of App B (Requester).
+        // We trust the value in KEY_SESSION_REQUESTER_UID because this method
+        // is protected by a signature permission in the Manifest.
         ContentValues valuesToInsert = new ContentValues();
-        valuesToInsert.put(SessionColumns.DATA_ROW_IDS,
-                values.getAsString(SessionColumns.DATA_ROW_IDS));
+        valuesToInsert.put(
+                SessionColumns.DATA_ROW_IDS,
+                values.getAsString(ContactsPickerSessionContract.Session.CONTACT_DATA_IDS));
         valuesToInsert.put(SessionColumns.SESSION_UID, sessionUid);
-        valuesToInsert.put(SessionColumns.CALLER_UID,
-                values.getAsInteger(SessionColumns.CALLER_UID));
+        valuesToInsert.put(
+                SessionColumns.CALLER_UID,
+                values.getAsInteger(ContactsPickerSessionContract.Session.SESSION_REQUESTER_UID));
         valuesToInsert.put(SessionColumns.CREATED_AT, System.currentTimeMillis());
 
         final SQLiteDatabase db = mDatabaseHelper.getWritableDatabase();
@@ -115,7 +121,11 @@ public final class ContactsPickerSessionProvider extends ContentProvider {
     }
 
     @Override
-    public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs,
+    public Cursor query(
+            Uri uri,
+            String[] projection,
+            String selection,
+            String[] selectionArgs,
             String sortOrder) {
         if (VERBOSE_LOGGING) {
             Log.d(TAG, "query: uri=" + uri);
@@ -128,8 +138,8 @@ public final class ContactsPickerSessionProvider extends ContentProvider {
                 }
                 yield null; // No session ID provided
             }
-            case URI_MATCH_SESSION_ID -> handleSessionIdQuery(uri, projection, selection,
-                    selectionArgs, sortOrder);
+            case URI_MATCH_SESSION_ID ->
+                    handleSessionIdQuery(uri, projection, selection, selectionArgs, sortOrder);
             default -> throw new IllegalArgumentException("Unknown URI: " + uri);
         };
     }
@@ -155,16 +165,16 @@ public final class ContactsPickerSessionProvider extends ContentProvider {
     }
 
     /**
-     * The call() method is exposed for invoking provider-defined methods.
-     * Currently, the only supported method is "cleanupStaleSessions".
+     * The call() method is exposed for invoking provider-defined methods. Currently, the only
+     * supported method is "cleanupStaleSessions".
      *
-     * <p>The "cleanupStaleSessions" method is used to trigger the cleanup of stale sessions.
-     * This method can only be called by the same process that is running this provider.
-     * Calls from other processes will result in a {@link SecurityException}.
+     * <p>The "cleanupStaleSessions" method is used to trigger the cleanup of stale sessions. This
+     * method can only be called by the same process that is running this provider. Calls from other
+     * processes will result in a {@link SecurityException}.
      *
      * @param method The name of the method to call. Currently only "cleanupStaleSessions" is
-     *               supported.
-     * @param arg    Optional string argument.
+     *     supported.
+     * @param arg Optional string argument.
      * @param extras Optional Bundle of extra data.
      * @return Always returns null.
      * @throws SecurityException if "cleanupStaleSessions" is called from a different process.
@@ -182,21 +192,20 @@ public final class ContactsPickerSessionProvider extends ContentProvider {
         return null;
     }
 
-    private record SessionData(String dataRowIds, int callerUid) {
-    }
+    private record SessionData(String dataRowIds, int callerUid) {}
 
     private SessionData getSessionData(String sessionUid) {
         final SQLiteDatabase db = mDatabaseHelper.getReadableDatabase();
 
         try (Cursor sessionCursor =
-                     db.query(
-                             Tables.SESSIONS,
-                             new String[]{SessionColumns.DATA_ROW_IDS, SessionColumns.CALLER_UID},
-                             SessionColumns.SESSION_UID + " = ?",
-                             new String[]{sessionUid},
-                             null,
-                             null,
-                             null)) {
+                db.query(
+                        Tables.SESSIONS,
+                        new String[] {SessionColumns.DATA_ROW_IDS, SessionColumns.CALLER_UID},
+                        SessionColumns.SESSION_UID + " = ?",
+                        new String[] {sessionUid},
+                        null,
+                        null,
+                        null)) {
             if (!sessionCursor.moveToFirst()) {
                 return null; // Session not found
             }
@@ -207,8 +216,12 @@ public final class ContactsPickerSessionProvider extends ContentProvider {
         }
     }
 
-    private Cursor handleSessionIdQuery(Uri uri, String[] projection, String selection,
-            String[] selectionArgs, String sortOrder) {
+    private Cursor handleSessionIdQuery(
+            Uri uri,
+            String[] projection,
+            String selection,
+            String[] selectionArgs,
+            String sortOrder) {
         final String sessionUid = uri.getLastPathSegment();
         final SessionData sessionData = getSessionData(sessionUid);
         if (sessionData == null) {
@@ -218,19 +231,45 @@ public final class ContactsPickerSessionProvider extends ContentProvider {
             return null;
         }
 
+        // Verify that the caller (App B) matches the UID stored during insert.
         final int callingUid = Binder.getCallingUid();
         if (sessionData.callerUid != callingUid) {
             throw new SecurityException(
-                    "Calling UID " + callingUid + " does not match session owner "
-                            + sessionData.callerUid + " for session UID: " + sessionUid);
+                    "Calling UID "
+                            + callingUid
+                            + " does not match session owner "
+                            + sessionData.callerUid
+                            + " for session UID: "
+                            + sessionUid);
         }
 
-        DataQuery dataQuery = buildDataQuerySelection(sessionData.dataRowIds, selection,
-                selectionArgs);
-        return getContext()
-                .getContentResolver()
-                .query(Data.CONTENT_URI, projection, dataQuery.selection, dataQuery.selectionArgs,
-                        sortOrder);
+        DataQuery dataQuery =
+                buildDataQuerySelection(sessionData.dataRowIds, selection, selectionArgs);
+
+        // Calling identity must be cleared to query ContactsContract.Data using this provider's
+        // identity.
+        //
+        // This is necessary for two reasons:
+        // 1. Package Mismatch: ContactsProvider verifies that the Calling UID owns the Calling
+        //    Package. Without clearing, it sees the Client's UID (App B) but this Provider's
+        //    Package, causing a SecurityException ("Package ... does not belong to ...").
+        //
+        // 2. Permissions: The Client app does not need to have READ_CONTACTS permission. This
+        //    provider acts as a privileged proxy, fetching the data on the client's behalf only
+        //    after verifying that the client owns this specific session.
+        final long token = Binder.clearCallingIdentity();
+        try {
+            return getContext()
+                    .getContentResolver()
+                    .query(
+                            Data.CONTENT_URI,
+                            projection,
+                            dataQuery.selection,
+                            dataQuery.selectionArgs,
+                            sortOrder);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
     }
 
     private static class DataQuery {
@@ -243,71 +282,93 @@ public final class ContactsPickerSessionProvider extends ContentProvider {
         }
     }
 
-    private DataQuery buildDataQuerySelection(String dataRowIds, String callerSelection,
-            String[] callerSelectionArgs) {
-        String[] dataIds = dataRowIds.split(",");
-        StringBuilder inClause = new StringBuilder();
-        for (int i = 0; i < dataIds.length; i++) {
-            inClause.append(i == 0 ? "?" : ",?");
-        }
+    private DataQuery buildDataQuerySelection(
+            String dataRowIds, String callerSelection, String[] callerSelectionArgs) {
 
-        String finalSelection = Data._ID + " IN (" + inClause + ")";
+        String jsonArrayString = "[" + dataRowIds + "]";
+        String finalSelection = Data._ID + " IN (SELECT value FROM json_each(?))";
+
         if (!TextUtils.isEmpty(callerSelection)) {
             finalSelection += " AND (" + callerSelection + ")";
         }
 
         String[] finalSelectionArgs;
         if (callerSelectionArgs != null) {
-            finalSelectionArgs = new String[dataIds.length + callerSelectionArgs.length];
-            System.arraycopy(dataIds, 0, finalSelectionArgs, 0, dataIds.length);
-            System.arraycopy(callerSelectionArgs, 0, finalSelectionArgs, dataIds.length,
-                    callerSelectionArgs.length);
+            finalSelectionArgs = new String[1 + callerSelectionArgs.length];
+            finalSelectionArgs[0] = jsonArrayString;
+            System.arraycopy(
+                    callerSelectionArgs, 0, finalSelectionArgs, 1, callerSelectionArgs.length);
         } else {
-            finalSelectionArgs = dataIds;
+            finalSelectionArgs = new String[] {jsonArrayString};
         }
+
         return new DataQuery(finalSelection, finalSelectionArgs);
     }
 
-    // TODO(b/456723413): Finalize validation logic.
     private void validateContentValues(ContentValues values) {
         if (values == null) {
             throw new IllegalArgumentException("Insert operation failed: ContentValues is null.");
         }
 
-        String dataRowIds = values.getAsString(SessionColumns.DATA_ROW_IDS);
-        if (TextUtils.isEmpty(dataRowIds)) {
+        String contactDataIds =
+                values.getAsString(ContactsPickerSessionContract.Session.CONTACT_DATA_IDS);
+        if (TextUtils.isEmpty(contactDataIds)) {
             throw new IllegalArgumentException(
-                    "Insert operation failed: DATA_ROW_IDS is missing or empty.");
+                    "Insert operation failed: "
+                            + ContactsPickerSessionContract.Session.CONTACT_DATA_IDS
+                            + " is empty.");
         }
 
-        // Validate that dataRowIds are comma-separated long integers
-        String[] ids = dataRowIds.split(",");
+        // Validate that contact data ids are comma-separated long integers
+        String[] ids = contactDataIds.split(",");
+        if (ids.length == 0) {
+            throw new IllegalArgumentException(
+                    "Insert operation failed: "
+                            + ContactsPickerSessionContract.Session.CONTACT_DATA_IDS
+                            + " is empty.");
+        }
         for (String id : ids) {
-            try {
-                Long.parseLong(id.trim());
-            } catch (NumberFormatException e) {
-                throw new IllegalArgumentException("Invalid dataRowIds format: " + dataRowIds
-                        + ". Must be comma-separated longs.", e);
+            String trimmedId = id.trim();
+            if (!trimmedId.isEmpty()) {
+                try {
+                    Long.parseLong(trimmedId);
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException(
+                            "Insert operation failed:"
+                                    + ContactsPickerSessionContract.Session.CONTACT_DATA_IDS
+                                    + " must be comma-separated longs.",
+                            e);
+                }
+            } else {
+                throw new IllegalArgumentException(
+                        "Insert operation failed: In "
+                                + ContactsPickerSessionContract.Session.CONTACT_DATA_IDS
+                                + ", empty string between commas is not allowed.");
             }
         }
 
-        if (!values.containsKey(SessionColumns.CALLER_UID)) {
-            throw new IllegalArgumentException("Insert operation failed: CALLER_UID is missing.");
+        if (!values.containsKey(ContactsPickerSessionContract.Session.SESSION_REQUESTER_UID)) {
+            throw new IllegalArgumentException(
+                    "Insert operation failed: "
+                            + ContactsPickerSessionContract.Session.SESSION_REQUESTER_UID
+                            + " is missing.");
         }
 
-        Integer callerUid = values.getAsInteger(SessionColumns.CALLER_UID);
-        if (callerUid == null) {
+        Integer sessionRequesterUid =
+                values.getAsInteger(ContactsPickerSessionContract.Session.SESSION_REQUESTER_UID);
+        if (sessionRequesterUid == null) {
             throw new IllegalArgumentException(
-                    "Insert operation failed: CALLER_UID cannot be null.");
+                    "Insert operation failed: "
+                            + ContactsPickerSessionContract.Session.SESSION_REQUESTER_UID
+                            + " cannot be null.");
         }
     }
 
-    /**
-     * Deletes sessions that are older than 24 hours from the database.
-     */
+    /** Deletes sessions that are older than 24 hours from the database. */
     private void cleanupStaleSessions() {
-        long expirationTimestamp = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(
-                ContactsPickerWorkScheduler.CLEANUP_INTERVAL_DAYS);
+        long expirationTimestamp =
+                System.currentTimeMillis()
+                        - TimeUnit.DAYS.toMillis(ContactsPickerJobScheduler.CLEANUP_INTERVAL_DAYS);
         String selection = SessionColumns.CREATED_AT + " <= ?";
         String[] selectionArgs = {String.valueOf(expirationTimestamp)};
         SQLiteDatabase db = mDatabaseHelper.getWritableDatabase();
