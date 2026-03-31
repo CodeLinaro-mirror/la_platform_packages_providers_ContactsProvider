@@ -25,6 +25,7 @@ import static android.provider.Flags.newAccountAttributesApiEnabled;
 import static com.android.providers.contacts.flags.Flags.cp2SyncSearchIndexFlag;
 import static com.android.providers.contacts.flags.Flags.directoryProviderQueryPermissionCheck;
 import static com.android.providers.contacts.flags.Flags.disableCp2AccountMoveFlag;
+import static com.android.providers.contacts.flags.Flags.enforceStrictSqlChecks;
 import static com.android.providers.contacts.flags.Flags.insertAccountLogging;
 import static com.android.providers.contacts.flags.Flags.logCallMethod;
 import static com.android.providers.contacts.flags.Flags.restrictPiiDataUriColumns;
@@ -73,6 +74,7 @@ import android.database.MatrixCursor.RowBuilder;
 import android.database.MergeCursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteDoneException;
+import android.database.sqlite.SQLiteException;
 import android.database.sqlite.SQLiteQueryBuilder;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -195,6 +197,7 @@ import com.android.providers.contacts.database.DeletedContactsTableUtil;
 import com.android.providers.contacts.database.MoreDatabaseUtils;
 import com.android.providers.contacts.enterprise.EnterpriseContactsCursorWrapper;
 import com.android.providers.contacts.enterprise.EnterprisePolicyGuard;
+import com.android.providers.contacts.picker.ContactsPickerSessionProvider;
 import com.android.providers.contacts.util.Clock;
 import com.android.providers.contacts.util.ContactsPermissions;
 import com.android.providers.contacts.util.DbQueryUtils;
@@ -374,8 +377,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
     public static final int CONTACTS_ID_DISPLAY_PHOTO_CORP = 1028;
     public static final int CONTACTS_FILTER_ENTERPRISE = 1029;
     public static final int CONTACTS_ENTERPRISE = 1030;
-    private static final int CONTACTS_DATA = 1031;
-    private static final int CONTACTS_DATA_FILTER = 1032;
+    private static final int CONTACTS_MIMES = 1031;
+    private static final int CONTACTS_MIMES_FILTER = 1032;
 
     public static final int RAW_CONTACTS = 2002;
     public static final int RAW_CONTACTS_ID = 2003;
@@ -1277,9 +1280,9 @@ public class ContactsProvider2 extends AbstractContactsProvider
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/filter_enterprise/*",
                 CONTACTS_FILTER_ENTERPRISE);
 
-        matcher.addURI(ContactsContract.AUTHORITY, "contacts_data", CONTACTS_DATA);
-        matcher.addURI(ContactsContract.AUTHORITY, "contacts_data/filter/*",
-                CONTACTS_DATA_FILTER);
+        matcher.addURI(ContactsContract.AUTHORITY, "contacts/mimes", CONTACTS_MIMES);
+        matcher.addURI(ContactsContract.AUTHORITY, "contacts/mimes/filter/*",
+                CONTACTS_MIMES_FILTER);
 
         matcher.addURI(ContactsContract.AUTHORITY, "raw_contacts", RAW_CONTACTS);
         matcher.addURI(ContactsContract.AUTHORITY, "raw_contacts/#", RAW_CONTACTS_ID);
@@ -2459,6 +2462,26 @@ public class ContactsProvider2 extends AbstractContactsProvider
         mInProfileMode.set(false);
     }
 
+    private void maybeStripAndThrowSQLiteExceptionWithJson(Exception e, String permission,
+            LogFields.Builder logBuilder) {
+        // b/465133716: Using certain "json" tokens exposes a side channel attack by deciphering
+        // the error message, so we strip the same.
+        //
+        // Note: We use checkCallingPermission() instead of checkCallingOrSelfPermission()
+        // intentionally. If the call is coming from a non-binder thread (e.g., self-call
+        // after clearing identity), we don't want to grant access to the raw error message
+        // if it might contain sensitive info triggered by user-provided SQL.
+        if (e instanceof SQLiteException
+                && getContext().checkCallingPermission(permission) != PERMISSION_GRANTED) {
+            final String message = e.getMessage();
+            if (message != null && message.toLowerCase(Locale.ROOT).contains("json")) {
+                SQLiteException strippedEx = new SQLiteException("Stripped exception message");
+                logBuilder.setException(strippedEx);
+                throw strippedEx;
+            }
+        }
+    }
+
     @Override
     public Uri insert(Uri uri, ContentValues values) {
         LogFields.Builder logBuilder = LogFields.Builder.aLogFields()
@@ -2494,6 +2517,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             resultUri = super.insert(uri, values);
             return resultUri;
         } catch (Exception e) {
+            maybeStripAndThrowSQLiteExceptionWithJson(e, WRITE_PERMISSION, logBuilder);
             logBuilder.setException(e);
             throw e;
         } finally {
@@ -2540,6 +2564,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             updates = super.update(uri, values, selection, selectionArgs);
             return updates;
         } catch (Exception e) {
+            maybeStripAndThrowSQLiteExceptionWithJson(e, WRITE_PERMISSION, logBuilder);
             logBuilder.setException(e);
             throw e;
         } finally {
@@ -2578,6 +2603,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             deletes = super.delete(uri, selection, selectionArgs);
             return deletes;
         } catch (Exception e) {
+            maybeStripAndThrowSQLiteExceptionWithJson(e, WRITE_PERMISSION, logBuilder);
             logBuilder.setException(e);
             throw e;
         } finally {
@@ -6199,13 +6225,18 @@ public class ContactsProvider2 extends AbstractContactsProvider
         try {
             cursor = queryInternal(uri, projection, selection, selectionArgs, sortOrder,
                     cancellationSignal);
+            if (cursor != null) {
+                // Consuming the cursor allows the actual exception (if any) thrown to be
+                // caught in the exception block below.
+                logBuilder.setResultCount(cursor.getCount());
+            }
             return cursor;
         } catch (Exception e) {
+            maybeStripAndThrowSQLiteExceptionWithJson(e, READ_PERMISSION, logBuilder);
             logBuilder.setException(e);
             throw e;
         } finally {
-            LogUtils.log(
-                    logBuilder.setResultCount(cursor == null ? 0 : cursor.getCount()).build());
+            LogUtils.log(logBuilder.build());
         }
     }
 
@@ -6820,6 +6851,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
                     long contactId = Long.parseLong(pathSegments.get(3));
                     SQLiteQueryBuilder lookupQb = new SQLiteQueryBuilder();
                     setTablesAndProjectionMapForContacts(lookupQb, projection);
+                    if (canEnforceStrictSqlChecksForQueries()) {
+                        lookupQb.setStrictColumns(true);
+                        lookupQb.setStrictGrammar(true);
+                    }
 
                     Cursor c = queryWithContactIdAndLookupKey(lookupQb, db,
                             projection, selection, selectionArgs, sortOrder, groupBy, limit,
@@ -6831,6 +6866,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 }
 
                 setTablesAndProjectionMapForContacts(qb, projection);
+                if (canEnforceStrictSqlChecksForQueries()) {
+                    qb.setStrictColumns(true);
+                    qb.setStrictGrammar(true);
+                }
                 selectionArgs = insertSelectionArg(selectionArgs,
                         String.valueOf(lookupContactIdByLookupKey(db, lookupKey)));
                 qb.appendWhere(Contacts._ID + "=?");
@@ -6878,7 +6917,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 break;
             }
 
-            case CONTACTS_DATA: {
+            case CONTACTS_MIMES: {
                 // This URI is added for the system contacts picker. Restrict access to callers
                 // holding the MANAGE_CONTACTS_PICKER_SESSION permission to ensure only system
                 // components can use it.
@@ -6890,7 +6929,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 break;
             }
 
-            case CONTACTS_DATA_FILTER: {
+            case CONTACTS_MIMES_FILTER: {
                 // This URI is added for the system contacts picker. Restrict access to callers
                 // holding the MANAGE_CONTACTS_PICKER_SESSION permission to ensure only system
                 // components can use it.
@@ -7741,6 +7780,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 final String usageType = uri.getQueryParameter(DataUsageFeedback.USAGE_TYPE);
                 final int typeInt = getDataUsageFeedbackType(usageType, USAGE_TYPE_ALL);
                 setTablesAndProjectionMapForData(qb, uri, projection, false, typeInt);
+                if (canEnforceStrictSqlChecksForQueries()) {
+                    qb.setStrictColumns(true);
+                    qb.setStrictGrammar(true);
+                }
                 if (uri.getBooleanQueryParameter(Data.VISIBLE_CONTACTS_ONLY, false)) {
                     qb.appendWhere(" AND " + Data.CONTACT_ID + " in " +
                             Tables.DEFAULT_DIRECTORY);
@@ -7751,6 +7794,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
             case DATA_ID:
             case PROFILE_DATA_ID: {
                 setTablesAndProjectionMapForData(qb, uri, projection, false);
+                if (canEnforceStrictSqlChecksForQueries()) {
+                    qb.setStrictColumns(true);
+                    qb.setStrictGrammar(true);
+                }
                 selectionArgs = insertSelectionArg(selectionArgs, uri.getLastPathSegment());
                 qb.appendWhere(" AND " + Data._ID + "=?");
                 break;
@@ -11149,5 +11196,23 @@ public class ContactsProvider2 extends AbstractContactsProvider
     private boolean isDataProjectionRestricted() {
         return restrictPiiDataUriColumns() && CompatChanges
                 .isChangeEnabled(ChangeIds.RESTRICT_DATA_URI_COLUMNS, Binder.getCallingUid());
+    }
+
+    @RequiresPermission(
+            allOf = {
+                    android.Manifest.permission.READ_COMPAT_CHANGE_CONFIG,
+                    android.Manifest.permission.LOG_COMPAT_CHANGE
+            })
+    // TODO(b/484953293): Enforce this check on more URIs as well.
+    private boolean canEnforceStrictSqlChecksForQueries() {
+        // Strict Sql checks can be enforced when either
+        // 1. Call is forwarded from SessionsProvider
+        // 2. The caller is another app (not cp2) not holding READ_CONTACTS + flag is enabled
+        // + caller is compatible with the change.
+        return ContactsPickerSessionProvider.sIsForwardedFromSessionsProvider.get()
+                || (getContext().checkCallingOrSelfPermission(READ_PERMISSION) != PERMISSION_GRANTED
+                && enforceStrictSqlChecks()
+                && CompatChanges
+                .isChangeEnabled(ChangeIds.ENFORCE_STRICT_SQL_CHECKS, Binder.getCallingUid()));
     }
 }
