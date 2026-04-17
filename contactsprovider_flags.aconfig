@@ -95,8 +95,17 @@ flag {
    name: "enforce_strict_sql_checks"
    namespace: "profile_experiences"
    description: "Enforces strict sql checks for callers without READ_CONTACTS permission"
-   bug: "465133716"
+   bug: "484953293"
    metadata {
        purpose: PURPOSE_BUGFIX
+   }
+}
+flag {
+    name: "enable_people_provider"
+    namespace: "contacts"
+    description: "Enables PeopleProvider so that it responds to queries"
+    bug: "461859503"
+    metadata {
+       purpose: PURPOSE_FEATURE
    }
 }

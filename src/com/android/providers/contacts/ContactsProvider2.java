@@ -25,6 +25,7 @@ import static android.provider.Flags.newAccountAttributesApiEnabled;
 import static com.android.providers.contacts.flags.Flags.cp2SyncSearchIndexFlag;
 import static com.android.providers.contacts.flags.Flags.directoryProviderQueryPermissionCheck;
 import static com.android.providers.contacts.flags.Flags.disableCp2AccountMoveFlag;
+import static com.android.providers.contacts.flags.Flags.enforceStrictSqlChecks;
 import static com.android.providers.contacts.flags.Flags.insertAccountLogging;
 import static com.android.providers.contacts.flags.Flags.logCallMethod;
 import static com.android.providers.contacts.flags.Flags.restrictPiiDataUriColumns;
@@ -196,15 +197,19 @@ import com.android.providers.contacts.database.DeletedContactsTableUtil;
 import com.android.providers.contacts.database.MoreDatabaseUtils;
 import com.android.providers.contacts.enterprise.EnterpriseContactsCursorWrapper;
 import com.android.providers.contacts.enterprise.EnterprisePolicyGuard;
+import com.android.providers.contacts.picker.ContactsPickerSessionProvider;
 import com.android.providers.contacts.util.Clock;
 import com.android.providers.contacts.util.ContactsPermissions;
 import com.android.providers.contacts.util.DbQueryUtils;
 import com.android.providers.contacts.util.LogFields;
 import com.android.providers.contacts.util.LogUtils;
 import com.android.providers.contacts.util.NeededForTesting;
+import com.android.providers.contacts.util.PccAwareUidComparator;
 import com.android.providers.contacts.util.UserUtils;
 import com.android.vcard.VCardComposer;
 import com.android.vcard.VCardConfig;
+
+import libcore.io.IoUtils;
 
 import com.google.android.collect.Lists;
 import com.google.android.collect.Maps;
@@ -212,8 +217,6 @@ import com.google.android.collect.Sets;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.primitives.Ints;
-
-import libcore.io.IoUtils;
 
 import java.io.BufferedWriter;
 import java.io.ByteArrayOutputStream;
@@ -375,8 +378,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
     public static final int CONTACTS_ID_DISPLAY_PHOTO_CORP = 1028;
     public static final int CONTACTS_FILTER_ENTERPRISE = 1029;
     public static final int CONTACTS_ENTERPRISE = 1030;
-    private static final int CONTACTS_DATA = 1031;
-    private static final int CONTACTS_DATA_FILTER = 1032;
+    private static final int CONTACTS_MIMES = 1031;
+    private static final int CONTACTS_MIMES_FILTER = 1032;
 
     public static final int RAW_CONTACTS = 2002;
     public static final int RAW_CONTACTS_ID = 2003;
@@ -987,38 +990,56 @@ public class ContactsProvider2 extends AbstractContactsProvider
             .build();
 
     /** Contains the data and contacts columns, for joined tables */
-    private static final ProjectionMap sPhoneLookupProjectionMap = ProjectionMap.builder()
-            .add(PhoneLookup._ID, "contacts_view." + Contacts._ID)
-            .add(PhoneLookup.CONTACT_ID, "contacts_view." + Contacts._ID)
-            .add(PhoneLookup.DATA_ID, PhoneLookup.DATA_ID)
-            .add(PhoneLookup.LOOKUP_KEY, "contacts_view." + Contacts.LOOKUP_KEY)
-            .add(PhoneLookup.DISPLAY_NAME_SOURCE, "contacts_view." + Contacts.DISPLAY_NAME_SOURCE)
-            .add(PhoneLookup.DISPLAY_NAME, "contacts_view." + Contacts.DISPLAY_NAME)
-            .add(PhoneLookup.DISPLAY_NAME_ALTERNATIVE,
-                    "contacts_view." + Contacts.DISPLAY_NAME_ALTERNATIVE)
-            .add(PhoneLookup.PHONETIC_NAME, "contacts_view." + Contacts.PHONETIC_NAME)
-            .add(PhoneLookup.PHONETIC_NAME_STYLE, "contacts_view." + Contacts.PHONETIC_NAME_STYLE)
-            .add(PhoneLookup.SORT_KEY_PRIMARY, "contacts_view." + Contacts.SORT_KEY_PRIMARY)
-            .add(PhoneLookup.SORT_KEY_ALTERNATIVE, "contacts_view." + Contacts.SORT_KEY_ALTERNATIVE)
-            .add(PhoneLookup.LR_LAST_TIME_CONTACTED, "contacts_view." + Contacts.LR_LAST_TIME_CONTACTED)
-            .add(PhoneLookup.LR_TIMES_CONTACTED, "contacts_view." + Contacts.LR_TIMES_CONTACTED)
-            .add(PhoneLookup.STARRED, "contacts_view." + Contacts.STARRED)
-            .add(PhoneLookup.IN_DEFAULT_DIRECTORY, "contacts_view." + Contacts.IN_DEFAULT_DIRECTORY)
-            .add(PhoneLookup.IN_VISIBLE_GROUP, "contacts_view." + Contacts.IN_VISIBLE_GROUP)
-            .add(PhoneLookup.PHOTO_ID, "contacts_view." + Contacts.PHOTO_ID)
-            .add(PhoneLookup.PHOTO_FILE_ID, "contacts_view." + Contacts.PHOTO_FILE_ID)
-            .add(PhoneLookup.PHOTO_URI, "contacts_view." + Contacts.PHOTO_URI)
-            .add(PhoneLookup.PHOTO_THUMBNAIL_URI, "contacts_view." + Contacts.PHOTO_THUMBNAIL_URI)
-            .add(PhoneLookup.CUSTOM_RINGTONE, "contacts_view." + Contacts.CUSTOM_RINGTONE)
-            .add(PhoneLookup.HAS_PHONE_NUMBER, "contacts_view." + Contacts.HAS_PHONE_NUMBER)
-            .add(PhoneLookup.SEND_TO_VOICEMAIL, "contacts_view." + Contacts.SEND_TO_VOICEMAIL)
-            .add(PhoneLookup.NUMBER, Phone.NUMBER)
-            .add(PhoneLookup.TYPE, Phone.TYPE)
-            .add(PhoneLookup.LABEL, Phone.LABEL)
-            .add(PhoneLookup.NORMALIZED_NUMBER, Phone.NORMALIZED_NUMBER)
-            .add(Data.PREFERRED_PHONE_ACCOUNT_COMPONENT_NAME)
-            .add(Data.PREFERRED_PHONE_ACCOUNT_ID)
-            .build();
+    private static final ProjectionMap sPhoneLookupProjectionMap =
+            ProjectionMap.builder()
+                    .add(PhoneLookup._ID, "contacts_view." + Contacts._ID)
+                    .add(PhoneLookup.CONTACT_ID, "contacts_view." + Contacts._ID)
+                    .add(PhoneLookup.DATA_ID, PhoneLookup.DATA_ID)
+                    .add(PhoneLookup.LOOKUP_KEY, "contacts_view." + Contacts.LOOKUP_KEY)
+                    .add(
+                            PhoneLookup.DISPLAY_NAME_SOURCE,
+                            "contacts_view." + Contacts.DISPLAY_NAME_SOURCE)
+                    .add(PhoneLookup.DISPLAY_NAME, "contacts_view." + Contacts.DISPLAY_NAME)
+                    .add(
+                            PhoneLookup.DISPLAY_NAME_ALTERNATIVE,
+                            "contacts_view." + Contacts.DISPLAY_NAME_ALTERNATIVE)
+                    .add(PhoneLookup.PHONETIC_NAME, "contacts_view." + Contacts.PHONETIC_NAME)
+                    .add(
+                            PhoneLookup.PHONETIC_NAME_STYLE,
+                            "contacts_view." + Contacts.PHONETIC_NAME_STYLE)
+                    .add(PhoneLookup.SORT_KEY_PRIMARY, "contacts_view." + Contacts.SORT_KEY_PRIMARY)
+                    .add(
+                            PhoneLookup.SORT_KEY_ALTERNATIVE,
+                            "contacts_view." + Contacts.SORT_KEY_ALTERNATIVE)
+                    .add(
+                            PhoneLookup.LR_LAST_TIME_CONTACTED,
+                            "contacts_view." + Contacts.LR_LAST_TIME_CONTACTED)
+                    .add(
+                            PhoneLookup.LR_TIMES_CONTACTED,
+                            "contacts_view." + Contacts.LR_TIMES_CONTACTED)
+                    .add(PhoneLookup.STARRED, "contacts_view." + Contacts.STARRED)
+                    .add(
+                            PhoneLookup.IN_DEFAULT_DIRECTORY,
+                            "contacts_view." + Contacts.IN_DEFAULT_DIRECTORY)
+                    .add(PhoneLookup.IN_VISIBLE_GROUP, "contacts_view." + Contacts.IN_VISIBLE_GROUP)
+                    .add(PhoneLookup.PHOTO_ID, "contacts_view." + Contacts.PHOTO_ID)
+                    .add(PhoneLookup.PHOTO_FILE_ID, "contacts_view." + Contacts.PHOTO_FILE_ID)
+                    .add(PhoneLookup.PHOTO_URI, "contacts_view." + Contacts.PHOTO_URI)
+                    .add(
+                            PhoneLookup.PHOTO_THUMBNAIL_URI,
+                            "contacts_view." + Contacts.PHOTO_THUMBNAIL_URI)
+                    .add(PhoneLookup.CUSTOM_RINGTONE, "contacts_view." + Contacts.CUSTOM_RINGTONE)
+                    .add(PhoneLookup.HAS_PHONE_NUMBER, "contacts_view." + Contacts.HAS_PHONE_NUMBER)
+                    .add(
+                            PhoneLookup.SEND_TO_VOICEMAIL,
+                            "contacts_view." + Contacts.SEND_TO_VOICEMAIL)
+                    .add(PhoneLookup.NUMBER, Phone.NUMBER)
+                    .add(PhoneLookup.TYPE, Phone.TYPE)
+                    .add(PhoneLookup.LABEL, Phone.LABEL)
+                    .add(PhoneLookup.NORMALIZED_NUMBER, Phone.NORMALIZED_NUMBER)
+                    .add(Data.PREFERRED_PHONE_ACCOUNT_COMPONENT_NAME)
+                    .add(Data.PREFERRED_PHONE_ACCOUNT_ID)
+                    .build();
 
     /** Contains the just the {@link Groups} columns */
     private static final ProjectionMap sGroupsProjectionMap = ProjectionMap.builder()
@@ -1278,9 +1299,9 @@ public class ContactsProvider2 extends AbstractContactsProvider
         matcher.addURI(ContactsContract.AUTHORITY, "contacts/filter_enterprise/*",
                 CONTACTS_FILTER_ENTERPRISE);
 
-        matcher.addURI(ContactsContract.AUTHORITY, "contacts_data", CONTACTS_DATA);
-        matcher.addURI(ContactsContract.AUTHORITY, "contacts_data/filter/*",
-                CONTACTS_DATA_FILTER);
+        matcher.addURI(ContactsContract.AUTHORITY, "contacts/mimes", CONTACTS_MIMES);
+        matcher.addURI(ContactsContract.AUTHORITY, "contacts/mimes/filter/*",
+                CONTACTS_MIMES_FILTER);
 
         matcher.addURI(ContactsContract.AUTHORITY, "raw_contacts", RAW_CONTACTS);
         matcher.addURI(ContactsContract.AUTHORITY, "raw_contacts/#", RAW_CONTACTS_ID);
@@ -6411,7 +6432,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
         // process.
         final int myUid = android.os.Process.myUid();
         final int callingUid = Binder.getCallingUid();
-        return (myUid != callingUid) && UserHandle.isSameApp(myUid, callingUid);
+        return (myUid != callingUid)
+                && PccAwareUidComparator.isSameApp(getContext(), myUid, callingUid);
     }
 
     private boolean doesCallerHoldInteractAcrossUserPermission() {
@@ -6849,6 +6871,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
                     long contactId = Long.parseLong(pathSegments.get(3));
                     SQLiteQueryBuilder lookupQb = new SQLiteQueryBuilder();
                     setTablesAndProjectionMapForContacts(lookupQb, projection);
+                    if (canEnforceStrictSqlChecksForQueries()) {
+                        lookupQb.setStrictColumns(true);
+                        lookupQb.setStrictGrammar(true);
+                    }
 
                     Cursor c = queryWithContactIdAndLookupKey(lookupQb, db,
                             projection, selection, selectionArgs, sortOrder, groupBy, limit,
@@ -6860,6 +6886,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 }
 
                 setTablesAndProjectionMapForContacts(qb, projection);
+                if (canEnforceStrictSqlChecksForQueries()) {
+                    qb.setStrictColumns(true);
+                    qb.setStrictGrammar(true);
+                }
                 selectionArgs = insertSelectionArg(selectionArgs,
                         String.valueOf(lookupContactIdByLookupKey(db, lookupKey)));
                 qb.appendWhere(Contacts._ID + "=?");
@@ -6907,7 +6937,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 break;
             }
 
-            case CONTACTS_DATA: {
+            case CONTACTS_MIMES: {
                 // This URI is added for the system contacts picker. Restrict access to callers
                 // holding the MANAGE_CONTACTS_PICKER_SESSION permission to ensure only system
                 // components can use it.
@@ -6919,7 +6949,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 break;
             }
 
-            case CONTACTS_DATA_FILTER: {
+            case CONTACTS_MIMES_FILTER: {
                 // This URI is added for the system contacts picker. Restrict access to callers
                 // holding the MANAGE_CONTACTS_PICKER_SESSION permission to ensure only system
                 // components can use it.
@@ -7770,6 +7800,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 final String usageType = uri.getQueryParameter(DataUsageFeedback.USAGE_TYPE);
                 final int typeInt = getDataUsageFeedbackType(usageType, USAGE_TYPE_ALL);
                 setTablesAndProjectionMapForData(qb, uri, projection, false, typeInt);
+                if (canEnforceStrictSqlChecksForQueries()) {
+                    qb.setStrictColumns(true);
+                    qb.setStrictGrammar(true);
+                }
                 if (uri.getBooleanQueryParameter(Data.VISIBLE_CONTACTS_ONLY, false)) {
                     qb.appendWhere(" AND " + Data.CONTACT_ID + " in " +
                             Tables.DEFAULT_DIRECTORY);
@@ -7780,6 +7814,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
             case DATA_ID:
             case PROFILE_DATA_ID: {
                 setTablesAndProjectionMapForData(qb, uri, projection, false);
+                if (canEnforceStrictSqlChecksForQueries()) {
+                    qb.setStrictColumns(true);
+                    qb.setStrictGrammar(true);
+                }
                 selectionArgs = insertSelectionArg(selectionArgs, uri.getLastPathSegment());
                 qb.appendWhere(" AND " + Data._ID + "=?");
                 break;
@@ -11178,5 +11216,23 @@ public class ContactsProvider2 extends AbstractContactsProvider
     private boolean isDataProjectionRestricted() {
         return restrictPiiDataUriColumns() && CompatChanges
                 .isChangeEnabled(ChangeIds.RESTRICT_DATA_URI_COLUMNS, Binder.getCallingUid());
+    }
+
+    @RequiresPermission(
+            allOf = {
+                    android.Manifest.permission.READ_COMPAT_CHANGE_CONFIG,
+                    android.Manifest.permission.LOG_COMPAT_CHANGE
+            })
+    // TODO(b/484953293): Enforce this check on more URIs as well.
+    private boolean canEnforceStrictSqlChecksForQueries() {
+        // Strict Sql checks can be enforced when either
+        // 1. Call is forwarded from SessionsProvider
+        // 2. The caller is another app (not cp2) not holding READ_CONTACTS + flag is enabled
+        // + caller is compatible with the change.
+        return ContactsPickerSessionProvider.sIsForwardedFromSessionsProvider.get()
+                || (getContext().checkCallingOrSelfPermission(READ_PERMISSION) != PERMISSION_GRANTED
+                && enforceStrictSqlChecks()
+                && CompatChanges
+                .isChangeEnabled(ChangeIds.ENFORCE_STRICT_SQL_CHECKS, Binder.getCallingUid()));
     }
 }
